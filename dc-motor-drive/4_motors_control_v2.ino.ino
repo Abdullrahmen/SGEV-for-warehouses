@@ -1,159 +1,238 @@
-class SimplePID{
-  private:
-    float kp, kd, ki, umax;   // Parameters
-    float e_prev, e_integral; // Storage
+#define NUM_MOTORS 4
 
-  public:
-    SimplePID() : kp(1), kd(0), ki(0), umax(255), e_prev(0), e_integral(0){}
+/* ================= USER PARAMETERS ================= */
 
-    void setParams(float kpIn, float kdIn, float kiIn, float umaxIn){
-      kp = kpIn; kd = kdIn; ki = kiIn; umax = umaxIn;
-    }
+const float Ts = 0.01;                 // Sampling time [s]
+const float PWM_MAX = 255.0;
+const float PWM_MIN = -255.0;
+const float DEAD_ZONE = 140.0;
 
-    float error_value(int value, int target, float deltaT, int &power, int &dir){
-      // error
-      float e = target - value;
-    
-      // derivative
-      float dvdt = (e-e_prev)/(deltaT);
-    
-      // integral
-      e_integral = e_integral + e*deltaT;
-    
-      // control signal
-      float u = kp*e + kd*dvdt + ki*e_integral;
-      
-      // motor power
-      power = (int) fabs(u);
-      if( power > umax ){
-        power = umax;
-      }
+const int COUNTS_PER_REV = 750;
 
-      dir = 1;
-      if (u < 0)
-        dir = -1;
-
-      // store previous error
-      e_prev = e;
-      return u;
-    }
-};
-////////////////////////// PINs nubmers /////////////////////////////
 // FR, BR, FL, BL --> Front Right, Back Right, Front Left, Back Left
-const int IN1[4] = {22, 22, 33, 33};
-const int IN2[4] = {23, 23, 32, 32};
-const int ENABLE[4] = {21, 16, 25, 19};
-const int ENCODER_A[4] = {39, 17, 35, 13};
-const int ENCODER_B[4] = {36, 4, 34, 14}; 
 
-const float pid_kp = 1;
-const float pid_ki = 0;
-const float pid_kd = 0;
+float speed[4] = {0, 0, 0, 0};
+float speed_filt[4] = {0, 0, 0, 0};
+float speed_prev[4] = {0, 0, 0, 0};
 
-volatile int POS[4] = {0,0,0,0};
-long prevT = 0;
-SimplePID pid[4];
+/* Encoder pins (A, B) */
+const int ENC_A[NUM_MOTORS] = {39, 36, 32, 33};
+const int ENC_B[NUM_MOTORS] = {34, 35, 21, 19};
 
+/* Motor driver pins (H-Bridge: IN1, IN2, PWM) */
+const int IN1[NUM_MOTORS] = {2, 2, 16, 16};
+const int IN2[NUM_MOTORS] = {15, 15, 4, 4};
+const int PWM_PINS[NUM_MOTORS] = {25, 26, 27, 14};
 
+/* PWM settings */
+const int PWM_CHANNELS[NUM_MOTORS] = {0, 1, 2, 3};
+const int PWM_FREQ = 20000;
+const int PWM_RES  = 8;
 
-void setup(){
-  Serial.begin(115200);
+/* ================= PI CONTROLLER STRUCT ================= */
 
-  for (int i = 0; i < 4; i++) {
+typedef struct {
+  float Kp;
+  float Ki;
+  float ui;
+  float e;
+  float u;
+} PI_Controller;
+
+/* ================= PI CONTROLLERS (FROM MATLAB) ================= */
+
+PI_Controller motorPI[NUM_MOTORS] = {
+  {1.33, 7.65, 0, 0, 0},   
+  {0.621, 7.9, 0, 0, 0},  
+  {0.247, 7.85, 0, 0, 0},  
+  {0.579, 7.91, 0, 0, 0}   
+};
+
+/* ================= ENCODER VARIABLES ================= */
+
+volatile long encoderCount[NUM_MOTORS] = {0};
+
+/* ================= QUADRATURE ISR ================= */
+
+void IRAM_ATTR encoderISR(int id) {
+  bool A = digitalRead(ENC_A[id]);
+  bool B = digitalRead(ENC_B[id]);
+
+  if (A == B)
+    encoderCount[id]++;
+  else
+    encoderCount[id]--;
+}
+
+void IRAM_ATTR encoderISR0() { encoderISR(0); }
+void IRAM_ATTR encoderISR1() { encoderISR(1); }
+void IRAM_ATTR encoderISR2() { encoderISR(2); }
+void IRAM_ATTR encoderISR3() { encoderISR(3); }
+
+/* ================= UTILITY FUNCTIONS ================= */
+
+float saturate(float u) {
+  if (u > PWM_MAX) return PWM_MAX;
+  if (u < PWM_MIN) return PWM_MIN;
+  return u;
+}
+
+float deadZoneCompensation(float u) {
+  if (u > 0 && u < DEAD_ZONE) return DEAD_ZONE;
+  if (u < 0 && u > -DEAD_ZONE) return -DEAD_ZONE;
+  return u;
+}
+
+/* ================= DISCRETE PI CONTROLLER ================= */
+
+float PI_Update(PI_Controller *c, float reference, float feedback) {
+
+  c->e = reference - feedback;
+
+  float up = c->Kp * c->e;
+  float ui_new = c->ui + (c->Ki * Ts * c->e);
+
+  float u_unsat = up + ui_new;
+  float u_sat   = saturate(u_unsat);
+
+  /* Anti-windup */
+  if (u_unsat == u_sat) {
+    c->ui = ui_new;
+  }
+
+  u_sat = deadZoneCompensation(u_sat);
+  c->u = u_sat;
+
+  return c->u;
+}
+
+/* ================= SPEED COMPUTATION ================= */
+/* Returns speed in RPM */
+
+float readEncoderSpeed(int motorID) {
+
+  static long lastCount[NUM_MOTORS] = {0};
+
+  long count = encoderCount[motorID];
+  long delta = count - lastCount[motorID];
+  lastCount[motorID] = count;
+
+  float rpm = (delta / (float)COUNTS_PER_REV) * (60.0 / Ts);
+
+  //Low pass filtter (25 Hz cutoff)
+
+  speed_filt[motorID] = 0.9*speed_filt[motorID] + 0.05*rpm + 0.05*speed_prev[motorID];
+  speed_prev[motorID] = speed_filt[motorID];
+  return rpm;
+}
+
+/* ================= MOTOR DRIVER ================= */
+
+void setMotorPWM(int motorID, float pwmValue) {
+
+  int pwm = abs((int)pwmValue);
+  pwm = constrain(pwm, 0, 255);
+
+  if (pwmValue >= 0) {
+    digitalWrite(IN1[motorID], HIGH);
+    digitalWrite(IN2[motorID], LOW);
+  } else {
+    digitalWrite(IN1[motorID], LOW);
+    digitalWrite(IN2[motorID], HIGH);
+  }
+
+  ledcWrite(PWM_PINS[motorID], pwm);
+}
+
+/* ================= SETUP ================= */
+
+void setup() {
+
+   Serial.begin(115200);
+  
+  /* Motor pins */
+  for (int i = 0; i < NUM_MOTORS; i++) {
     pinMode(IN1[i], OUTPUT);
     pinMode(IN2[i], OUTPUT);
-    pinMode(ENABLE[i], INPUT);
-    pinMode(ENCODER_A[i], INPUT);
-    pinMode(ENCODER_B[i], INPUT);
 
-    pid[i].setParams(pid_kp, pid_kd, pid_ki, 255);
-    ledcAttachChannel(ENABLE[i], 10000, 8, i);
-  } 
-  // readEncoder template must be manual not in the loop
-  attachInterrupt(ENCODER_A[0],readEncoder<0>,RISING);
-  attachInterrupt(ENCODER_A[1],readEncoder<1>,RISING);
-  attachInterrupt(ENCODER_A[2],readEncoder<2>,RISING);
-  attachInterrupt(ENCODER_A[3],readEncoder<3>,RISING);
+    ledcAttachChannel(PWM_PINS[i], PWM_FREQ, PWM_RES, PWM_CHANNELS[i]);
+  }
 
-  Serial.println("target pos");
+  /* Encoder pins */
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    pinMode(ENC_A[i], INPUT_PULLUP);
+    pinMode(ENC_B[i], INPUT_PULLUP);
+  }
+
+  attachInterrupt(digitalPinToInterrupt(ENC_A[0]), encoderISR0, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A[1]), encoderISR1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A[2]), encoderISR2, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A[3]), encoderISR3, CHANGE);
 }
 
-int target[4] = {0,0,0,0};
-void loop(){
-  // set target position
-  for(int k = 0; k < 4; k++){
-    if (sin((prevT/1e6)/4)>0){ // 4 seconds
-      target[k] += 3; // ramp wave
-      if (target[k] > 1500)
-        target[k] = 1500;
-    }else{
-      target[k] -= 3;
-      if (target[k] < -1500)
-        target[k] = -1500;
-    }
-  }
+/* ================= MAIN LOOP ================= */
 
-   // time difference
-  long currT = micros();
-  float deltaT = ((long) (currT - prevT))/( 1.0e6 );
-  prevT = currT;
+void loop() {
 
-  // Read the position
-  int pos[4];
-  noInterrupts(); // disable interrupts temporarily while reading
-  for(int k = 0; k < 4; k++){
-      pos[k] = POS[k];
-    }
-  interrupts(); // turn interrupts back on
-  float u[4];
-  // loop through the motors
-  for(int k = 0; k < 4; k++){
-    int power, dir;
-    // evaluate the control signal
-    u[k] = pid[k].error_value(pos[k],target[k],deltaT,power,dir);
-    // signal the motor
-    setMotor(dir,power,k,IN1[k],IN2[k]);
-  }
-  Serial.print(" ");              // Separator
-  Serial.print(-2000);            // Dummy Min value (forces Y-min to -1000)
-  Serial.print(" ");              // Separator
-  Serial.print(2000);             // Dummy Max value (forces Y-max to 1000)
-  Serial.print(" ");              // Separator
+  static unsigned long lastTime = 0;
+  unsigned long now = millis();
 
-  for(int k = 0; k < 4; k++){
-    Serial.print(target[k]);
+  if (now - lastTime >= Ts * 1000) {
+    lastTime = now;
+
+    /* ===== MASTER REFERENCES (RPM) ===== */
+    float left_ref  = 80.0;
+    float right_ref = 80.0;
+
+    //ٌRight Master (RB)
+
+    speed[1] = readEncoderSpeed(1);
+    float pwm1   = PI_Update(&motorPI[1], right_ref, speed[1]);
+    setMotorPWM(1, pwm1);
+
+    Serial.print(speed[1]);
     Serial.print(" ");
-    Serial.print(pos[k]);
+
+    //Right Slave (RF)
+
+    speed[0] = readEncoderSpeed(0);
+    float pwm0   = PI_Update(&motorPI[0], speed[1], speed[0]);
+    setMotorPWM(0, pwm0);
+
+    Serial.print(speed[0]);
     Serial.print(" ");
-    // Serial.print(u[k]);
-    // Serial.print(" ");
-  }
-  Serial.println();
-}
 
-void setMotor(int dir, int pwmVal, int pwm_channel, int in1, int in2){
-  //analogWrite(pwm,pwmVal);
-  pwmVal = map(pwmVal, 0, 255, 100, 250);
-  ledcWriteChannel(pwm_channel, pwmVal);
-  if(dir == 1){
-    digitalWrite(in1,HIGH);
-    digitalWrite(in2,LOW);
-  }
-  else if(dir == -1){
-    digitalWrite(in1,LOW);
-    digitalWrite(in2,HIGH);
-  }
-  else{
-    digitalWrite(in1,LOW);
-    digitalWrite(in2,LOW);
-  }  
-}
+    //Left Master (LB)
 
-template <int j>
-void readEncoder(){
-  int b = digitalRead(ENCODER_B[j]);
-  if (b > 0)
-    POS[j]++;
-  else
-    POS[j]--;
+    speed[3] = readEncoderSpeed(3);
+    float pwm3   = PI_Update(&motorPI[3], left_ref, speed[3]);
+    setMotorPWM(3, pwm3);
+
+    Serial.print(speed[3]);
+    Serial.print(" ");
+
+    //Left Slave (LF)
+
+    speed[2] = readEncoderSpeed(2);
+    float pwm2   = PI_Update(&motorPI[2], speed[3], speed[2]);
+    setMotorPWM(2, pwm2);
+
+    Serial.print(speed[2]);
+    Serial.print(" ");
+
+    /*float reference[NUM_MOTORS] = {
+      left_ref, left_ref,
+      right_ref, right_ref
+    };
+
+    for (int i = 0; i < NUM_MOTORS; i++) {
+      speed[i] = readEncoderSpeed(i);
+      float pwm   = PI_Update(&motorPI[i], reference[i], speed[i]);
+      setMotorPWM(i, pwm);
+
+      Serial.print(speed[i]);
+      Serial.print(" ");
+    }*/
+    Serial.println();
+  }
 }
