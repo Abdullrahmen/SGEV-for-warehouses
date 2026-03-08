@@ -1,0 +1,245 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define NUM_MOTORS 4
+
+float left_ref_cmd  = 60.0;   
+float right_ref_cmd = 60.0;
+
+float left_ref_ramp  = 0.0;   
+float right_ref_ramp = 0.0;
+  
+const float accelLimit = 40.0;
+const float decelLimit = 60.0;
+
+bool motorActive = false;
+
+/* ================= USER PARAMETERS ================= */
+const float Ts = 0.01;   
+const float PWM_MAX = 255.0;
+const float PWM_MIN = -255.0;
+const float DEAD_ZONE = 100.0;
+const int COUNTS_PER_REV = 750;
+
+float speed[4] = {0};
+float speed_filt[4] = {0};
+float speed_prev[4] = {0};
+
+/* Encoder pins */
+const int ENC_A[NUM_MOTORS] = {39, 36, 32, 33};
+const int ENC_B[NUM_MOTORS] = {34, 35, 21, 19};
+
+/* Motor driver pins */
+const int IN1[NUM_MOTORS] = {2, 2, 16, 16};
+const int IN2[NUM_MOTORS] = {15, 15, 4, 4};
+const int PWM_PINS[NUM_MOTORS] = {25, 26, 27, 14};
+const int PWM_CHANNELS[NUM_MOTORS] = {0, 1, 2, 3};
+const int PWM_FREQ = 20000;
+const int PWM_RES = 8;
+
+/* ================= PI CONTROLLER ================= */
+typedef struct {
+  float Kp;
+  float Ki;
+  float ui;
+  float e;
+  float u;
+} PI_Controller;
+
+PI_Controller motorPI[NUM_MOTORS] = {
+  {1.53, 7.9, 0, 0, 0},
+  {1.621, 7.9, 0, 0, 0},
+  {1.247, 7.85, 0, 0, 0},
+  {1.579, 7.91, 0, 0, 0}
+};
+
+/* ================= WI-FI STATION ================= */
+const char* ssid = "ROBOT b NET?";
+const char* password = "RoBoT12345678#";
+
+WebServer server(80);
+
+// HTML page with two sliders and Go/Stop buttons
+const char htmlPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<title>Skid Steer Control</title>
+<style>
+  label { display:block; margin: 10px 0 5px; }
+  button { margin: 5px; padding: 10px; }
+</style>
+<script>
+function sendCmd(cmd){ fetch('/'+cmd); }
+function updateSlider(sliderId, displayId){
+  var val = document.getElementById(sliderId).value;
+  document.getElementById(displayId).innerText = val;
+  fetch('/set_'+sliderId+'?val='+val);
+}
+</script>
+</head>
+<body>
+<h2>Skid Steer Motor Control</h2>
+<button onclick="sendCmd('go')">GO</button>
+<button onclick="sendCmd('stop')">STOP</button>
+
+<label for="leftSlider">Left Motor Command: <span id="leftVal">60</span></label>
+<input type="range" id="leftSlider" min="-150" max="150" value="60" oninput="updateSlider('leftSlider','leftVal')">
+
+<label for="rightSlider">Right Motor Command: <span id="rightVal">60</span></label>
+<input type="range" id="rightSlider" min="-150" max="150" value="60" oninput="updateSlider('rightSlider','rightVal')">
+
+</body>
+</html>
+)rawliteral";
+
+/* ================= ENCODER VARIABLES ================= */
+volatile long encoderCount[NUM_MOTORS] = {0};
+
+/* ================= QUADRATURE ISR ================= */
+void IRAM_ATTR encoderISR(int id) {
+  bool A = digitalRead(ENC_A[id]);
+  bool B = digitalRead(ENC_B[id]);
+  if (A == B) encoderCount[id]++;
+  else encoderCount[id]--;
+}
+
+void IRAM_ATTR encoderISR0() { encoderISR(0); }
+void IRAM_ATTR encoderISR1() { encoderISR(1); }
+void IRAM_ATTR encoderISR2() { encoderISR(2); }
+void IRAM_ATTR encoderISR3() { encoderISR(3); }
+
+/* ================= UTILITY FUNCTIONS ================= */
+float saturate(float u) {
+  if(u>PWM_MAX) return PWM_MAX;
+  if(u<PWM_MIN) return PWM_MIN;
+  return u;
+}
+
+float deadZoneCompensation(float u) {
+  if(u>0 && u<DEAD_ZONE) return DEAD_ZONE;
+  if(u<0 && u>-DEAD_ZONE) return -DEAD_ZONE;
+  return u;
+}
+
+/* ================= DISCRETE PI CONTROLLER ================= */
+float PI_Update(PI_Controller *c, float reference, float feedback) {
+  c->e = reference - feedback;
+  float up = c->Kp * c->e;
+  float ui_new = c->ui + (c->Ki * Ts * c->e);
+  float u_unsat = up + ui_new;
+  float u_sat = saturate(u_unsat);
+  if(u_unsat == u_sat) c->ui = ui_new;
+  u_sat = deadZoneCompensation(u_sat);
+  c->u = u_sat;
+  return c->u;
+}
+
+/* ================= SPEED COMPUTATION ================= */
+float readEncoderSpeed(int motorID) {
+  static long lastCount[NUM_MOTORS] = {0};
+  long count = encoderCount[motorID];
+  long delta = count - lastCount[motorID];
+  lastCount[motorID] = count;
+  float rpm = (delta/(float)COUNTS_PER_REV)*(60.0/Ts);
+  speed_filt[motorID] = 0.9*speed_filt[motorID] + 0.05*rpm + 0.05*speed_prev[motorID];
+  speed_prev[motorID] = speed_filt[motorID];
+  return speed_filt[motorID];
+}
+
+/* ================= MOTOR DRIVER ================= */
+void setMotorPWM(int motorID, float pwmValue) {
+  int pwm = abs((int)pwmValue);
+  pwm = constrain(pwm,0,255);
+  if(pwmValue > 0){ digitalWrite(IN1[motorID],HIGH); digitalWrite(IN2[motorID],LOW); }
+  else if(pwmValue < 0){ digitalWrite(IN1[motorID],LOW); digitalWrite(IN2[motorID],HIGH); }
+  else{ digitalWrite(IN1[motorID],HIGH); digitalWrite(IN2[motorID],HIGH); }
+  ledcWrite(PWM_PINS[motorID], pwm);
+}
+
+/* ================= RAMP FUNCTION ================= */
+float rampToTarget(float current, float target, float accelStep, float decelStep) {
+  float delta = target - current;
+  bool sameDirection = (current*target) > 0;
+  bool increasingMagnitude = abs(target) > abs(current);
+  float stepLimit = (sameDirection && increasingMagnitude) ? accelStep : decelStep;
+  if(delta > stepLimit) delta = stepLimit;
+  if(delta < -stepLimit) delta = -stepLimit;
+  return current + delta;
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+
+  for(int i=0;i<NUM_MOTORS;i++){
+    pinMode(IN1[i],OUTPUT);
+    pinMode(IN2[i],OUTPUT);
+    ledcAttachChannel(PWM_PINS[i],PWM_FREQ,PWM_RES,PWM_CHANNELS[i]);
+    pinMode(ENC_A[i],INPUT_PULLUP);
+    pinMode(ENC_B[i],INPUT_PULLUP);
+  }
+
+  attachInterrupt(digitalPinToInterrupt(ENC_A[0]),encoderISR0,CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A[1]),encoderISR1,CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A[2]),encoderISR2,CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A[3]),encoderISR3,CHANGE);
+
+  // Wi-Fi
+  // Wi-Fi Access Point
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+
+  Serial.println("Access Point Started");
+  Serial.print("ESP32 AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+
+  // Webserver routes
+  server.on("/", [](){ server.send(200,"text/html",htmlPage); });
+  server.on("/go",   [](){ motorActive=true; server.send(200,"text/plain","OK"); });
+  server.on("/stop", [](){ motorActive=false; for(int i=0;i<NUM_MOTORS;i++) motorPI[i].ui=0; server.send(200,"text/plain","OK"); });
+  server.on("/set_leftSlider",  [](){ if(server.hasArg("val")) left_ref_cmd  = server.arg("val").toFloat(); server.send(200,"text/plain","OK"); });
+  server.on("/set_rightSlider", [](){ if(server.hasArg("val")) right_ref_cmd = server.arg("val").toFloat(); server.send(200,"text/plain","OK"); });
+  server.begin();
+}
+
+/* ================= MAIN LOOP ================= */
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastTime=0;
+  unsigned long now=millis();
+  if(now-lastTime >= Ts*1000){
+    lastTime=now;
+
+    float accelStep = accelLimit*Ts;
+    float decelStep = decelLimit*Ts;
+
+    if(motorActive){
+      left_ref_ramp  = rampToTarget(left_ref_ramp, left_ref_cmd, accelStep, decelStep);
+      right_ref_ramp = rampToTarget(right_ref_ramp, right_ref_cmd, accelStep, decelStep);
+    } else {
+      left_ref_ramp=0; right_ref_ramp=0;
+    }
+
+    for(int i=0;i<NUM_MOTORS;i++) speed[i] = readEncoderSpeed(i);
+
+    for(int i=0;i<NUM_MOTORS;i++){
+      float reference;
+      if(i==1 || i==0) reference=right_ref_ramp;
+      else reference=left_ref_ramp;
+
+      if(abs(reference)<0.5){ setMotorPWM(i,0); motorPI[i].ui=0; }
+      else setMotorPWM(i, PI_Update(&motorPI[i], reference, speed[i]));
+    }
+
+    // Optional serial print
+    Serial.print(speed[1]);Serial.print(" ");
+    Serial.print(speed[0]);Serial.print(" ");
+    Serial.print(speed[3]);Serial.print(" ");
+    Serial.print(speed[2]);Serial.print(" ");
+    Serial.print(right_ref_ramp);Serial.print(" ");
+    Serial.println(left_ref_ramp);
+  }
+}
