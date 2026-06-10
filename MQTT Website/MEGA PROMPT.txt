@@ -1,0 +1,1406 @@
+Role: You are a Senior Full-Stack Web Architect and Robotics Software Engineer.
+
+Project Goal: Build a production-grade "Warehouse Management & Robot Control Dashboard" for a graduation project. The system manages a fleet of ROS 2-style warehouse robots using Python Django (Backend) and React.js (Frontend). The system must be universal — any warehouse can deploy it by scanning their space with the robot and immediately operating from the web interface.
+
+Tech Stack:
+
+Backend: Python Django with Django REST Framework (DRF). Django Channels for WebSocket support.
+Database: PostgreSQL.
+Channel Layer: Redis (required for Django Channels cross-process communication).
+Frontend: React.js (Functional Components, Hooks).
+Styling: Material UI (MUI) v5 exclusively. "Clean Industrial" aesthetic. Dark/Light mode.
+Communication: MQTT via Eclipse Mosquitto (backend-only). WebSocket via Django Channels (frontend real-time). REST API (frontend data operations).
+Environment: python-decouple for environment variables (.env file).
+Image handling: Pillow (required for Django ImageField).
+
+SECTION 1: ARCHITECTURE OVERVIEW
+
+Five independent services communicate through MQTT and WebSocket:
+
+Django ASGI Server: The "Brain." Authentication, database, REST API, WebSocket consumer, order dispatch, state machine management, map storage. Runs via Daphne or Uvicorn (ASGI, not WSGI).
+Django MQTT Listener: The "Nerve Endings." Separate long-lived process. Subscribes to robot MQTT topics, updates the database, pushes real-time updates to WebSocket clients via the Channels layer.
+React Frontend: The "Interface." Visualization, manual control input, map scanning UI. Communicates with Django via REST API and WebSocket. Never connects to MQTT directly.
+MQTT Broker (Mosquitto): The "Nervous System." Connects Django services to robots.
+Redis: The "Switchboard." Channel layer backend enabling the MQTT Listener and ASGI Server to share real-time messages destined for WebSocket clients.
+Robot / Mock Script: The "Body." Navigation, SLAM, telemetry.
+
+Communication flows:
+
+React <-> Django ASGI Server: REST API (HTTP) + WebSocket (ws://).
+Django ASGI Server <-> Redis: Channel layer group messages.
+Django MQTT Listener <-> Redis: Channel layer group messages.
+Django MQTT Listener <-> Mosquitto: MQTT subscribe.
+Django ASGI Server (MQTTPublisher utility) <-> Mosquitto: MQTT publish.
+Robot / mock_robot.py <-> Mosquitto: MQTT publish and subscribe.
+
+Important: Django has TWO components that use MQTT, running in SEPARATE processes.
+Component 1: The MQTT Listener (management command). Subscribes to robot topics. Updates the database. Pushes updates to the Channels layer for WebSocket delivery.
+Component 2: The API views and WebSocket consumer (running inside the ASGI server). Need to PUBLISH to MQTT when dispatching orders, forwarding manual commands, starting scans, etc. A shared MQTTPublisher utility is used for this (see Section 4.2).
+
+Both components also interact with Redis via the Channels layer:
+The MQTT Listener pushes real-time data (pose, status, mission results, map previews) to the "dashboard" Channels group.
+The WebSocket consumer listens to the "dashboard" group and forwards messages to connected browser clients.
+
+The React frontend NEVER connects to the MQTT broker. All real-time data flows through the Django WebSocket. This keeps MQTT credentials server-side and enables server-side validation of all commands.
+
+SECTION 2: DATABASE MODELS
+
+2.1 Robot
+
+robot_id: CharField, Primary Key (e.g., "R1").
+name: CharField (e.g., "Warehouse Bot Alpha").
+system_status: CharField, Choices: ['ONLINE', 'OFFLINE', 'ERROR']. Updated by MQTT Listener (on receiving system_status topic or LWT). ERROR is for robot-reported hardware faults. A robot clears its own ERROR state by publishing system_status ONLINE when the fault is resolved. There is no manual admin override.
+operational_mode: CharField, Choices: ['IDLE', 'AUTO', 'MANUAL', 'SEMI_MANUAL', 'MAPPING']. Updated by Django API and MQTT Listener exclusively. Never set by MQTT messages from the robot directly.
+IDLE: Robot is available for tasks.
+AUTO: Robot is executing an order or ad-hoc navigation dispatched by the system.
+MANUAL: User is actively driving the robot with WASD keyboard controls.
+SEMI_MANUAL: User initiated click-to-navigate from the Manual Control page. Robot is autonomously navigating to a clicked point while the user retains control lock. On arrival or failure, reverts to MANUAL.
+MAPPING: Robot is performing a map scan (manual or autonomous).
+controlled_by: ForeignKey to User, nullable, on_delete=SET_NULL, related_name='controlled_robots'. Tracks which user currently has manual control of this robot. Set when a user takes control (MANUAL, SEMI_MANUAL, or MAPPING mode). Cleared when control is released or auto-released.
+current_task: ForeignKey to Order, nullable, on_delete=SET_NULL.
+pos_x: FloatField, default=0.0 (meters, from last known pose).
+pos_y: FloatField, default=0.0.
+yaw: FloatField, default=0.0 (radians).
+last_seen: DateTimeField, nullable. Timestamp of last received pose. Updated alongside pos_x/y/yaw.
+updated_at: DateTimeField, auto_now=True.
+
+DB Indexes: system_status, operational_mode.
+
+str: return f"{self.robot_id} - {self.name}"
+
+Auto-creation rule: When the MQTT Listener receives a system_status message for a robot_id that does not exist in the database, it must create the Robot record automatically. Use a try/except pattern: attempt select_for_update().get() inside transaction.atomic, catch DoesNotExist, then create with defaults: name=robot_id, system_status from payload, operational_mode='IDLE'. The unique primary key constraint guards against race conditions on concurrent creation.
+
+2.2 Product
+
+sku: CharField, Primary Key (e.g., "SKU-001").
+name: CharField (e.g., "Electronics Shelf A").
+updated_at: DateTimeField, auto_now=True.
+
+Products are decoupled from maps. A product can have a position on zero, one, or many maps via the ProductPosition through table.
+
+str: return f"{self.sku} - {self.name}"
+
+2.3 ProductPosition
+
+id: AutoField, Primary Key.
+product: ForeignKey to Product, on_delete=CASCADE, related_name='positions'.
+map: ForeignKey to WarehouseMap, on_delete=CASCADE, related_name='product_positions'.
+pos_x: FloatField (shelf location X in meters, relative to the associated map origin).
+pos_y: FloatField (shelf location Y in meters, relative to the associated map origin).
+unique_together: (product, map). A product has at most one position per map.
+
+str: return f"{self.product.sku} on {self.map.name} at ({self.pos_x}, {self.pos_y})"
+
+2.4 Order
+
+id: AutoField, Primary Key.
+product: ForeignKey to Product, on_delete=PROTECT. Using PROTECT prevents deleting products that have order history.
+assigned_robot: ForeignKey to Robot, nullable, on_delete=SET_NULL.
+status: CharField, Choices:
+'PENDING': Created, no IDLE robot available. Queued.
+'QUEUED_OFFLINE': Robot assigned but went OFFLINE. Will re-dispatch on reconnect or reassign after timeout.
+'IN_PROGRESS': Robot is actively navigating.
+'COMPLETED': Robot reached target and returned home.
+'FAILED': Robot reported failure.
+'CANCELLED': User manually cancelled, or auto-cancelled on active map change.
+created_at: DateTimeField, auto_now_add.
+updated_at: DateTimeField, auto_now=True.
+completed_at: DateTimeField, nullable.
+
+DB Indexes: status, created_at.
+
+str: return f"Order #{self.id} - {self.product.name} ({self.status})"
+
+2.5 WarehouseMap
+
+id: AutoField, Primary Key.
+name: CharField (e.g., "Main Warehouse - Floor 1").
+scanned_by: ForeignKey to Robot, nullable, on_delete=SET_NULL.
+map_image: ImageField, upload_to='maps/'. Occupancy grid PNG: white (>200) = free, black (<=200) = wall/obstacle, gray (~128) = unknown.
+resolution: FloatField (meters per pixel, e.g., 0.05 means 1 pixel = 5cm).
+origin_x: FloatField (real-world X in meters of the bottom-left pixel).
+origin_y: FloatField (real-world Y in meters of the bottom-left pixel).
+width_meters: FloatField (image_width_px * resolution).
+height_meters: FloatField (image_height_px * resolution).
+home_x: FloatField, default=0.0 (home/dropoff position X in meters).
+home_y: FloatField, default=0.0 (home/dropoff position Y in meters).
+is_active: BooleanField, default=False. Constraint: Only ONE map may be active at a time. Enforced in application logic using select_for_update on all map rows inside a transaction (see Section 4.4).
+created_at: DateTimeField, auto_now_add.
+updated_at: DateTimeField, auto_now=True.
+
+str: return f"{self.name} ({'Active' if self.is_active else 'Inactive'})"
+
+SECTION 3: AUTHENTICATION
+
+3.1 REST API Authentication
+
+Django REST Framework Token Authentication.
+All API endpoints require authentication except /api/v1/auth/login/ and /api/v1/health/.
+Frontend stores the token in localStorage and includes it in all API requests via Authorization: Token <token> header.
+
+3.2 Login
+
+React provides a Login page. On success, store token in localStorage, redirect to Dashboard.
+No registration page. Users are created via seed_demo_data management command or python manage.py createsuperuser.
+
+3.3 WebSocket Authentication
+
+WebSocket connections authenticate via token in the query parameter:
+ws://localhost:8000/ws/dashboard/?token=<auth_token>
+
+The WebSocket middleware extracts the token, looks up the user via DRF's Token model, and attaches the user to the connection scope. If the token is invalid or missing, the connection is rejected (close code 4001).
+
+3.4 Protected Routes
+
+All React routes except /login are wrapped in a ProtectedRoute component that checks for the auth token in localStorage. If absent, redirect to /login.
+The axios instance in api.js includes a response interceptor that catches 401 errors, clears the stored token, and redirects to /login.
+
+SECTION 4: BACKEND ARCHITECTURE
+
+4.1 PostgreSQL Configuration
+
+Configure in settings.py using standard Django DATABASES config. All credentials loaded from .env via python-decouple. PostgreSQL handles concurrent writes from the ASGI server and MQTT listener without issues.
+
+Media file configuration required in settings.py:
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+In development urls.py, add static file serving for media:
+from django.conf import settings
+from django.conf.urls.static import static
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+4.2 MQTT Publisher Utility
+
+File: api/utils/mqtt_publisher.py
+
+This is a thread-safe singleton MQTT client used by Django views and the WebSocket consumer to publish messages. It is separate from the MQTT Listener.
+
+Implementation:
+Create a class MQTTPublisher with a class-level _client variable (initialized to None) and a class-level _lock (threading.Lock).
+Provide a class method get_client() that acquires the lock, then:
+If _client is None or not connected, creates a new paho-mqtt Client instance.
+Sets username and password from settings/env.
+Connects to the broker.
+Calls loop_start() to run the network loop in a background thread.
+Stores the client in _client.
+Returns the client.
+Provide a class method publish(topic, payload, qos=1, retain=False) that calls get_client().publish().
+
+Note: In production with N ASGI workers, there will be N+1 MQTT connections (N publishers, one per worker + 1 listener process). This is acceptable for the graduation project.
+
+Usage:
+from api.utils.mqtt_publisher import MQTTPublisher
+MQTTPublisher.publish(f"warehouse/robots/{robot_id}/cmd_auto", json.dumps(payload), qos=1)
+
+4.3 WebSocket Notification Utility
+
+File: api/utils/ws_notify.py
+
+Helper functions used by both API views and the MQTT Listener to push real-time updates to all connected WebSocket clients via the Channels layer.
+
+Implementation:
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
+
+def notify_robot_pose(robot_id, x, y, yaw):
+channel_layer = get_channel_layer()
+async_to_sync(channel_layer.group_send)("dashboard", {
+"type": "robot_pose",
+"robot_id": robot_id,
+"x": x, "y": y, "yaw": yaw
+})
+
+def notify_robot_status(robot_id, system_status):
+...sends type "robot_status" with robot_id and system_status...
+
+def notify_robot_mode(robot_id, operational_mode, controlled_by_username):
+...sends type "robot_mode" with robot_id, operational_mode, controlled_by (username or null)...
+
+def notify_robot_mission(robot_id, status):
+...sends type "robot_mission" with robot_id and mission status (COMPLETED/FAILED)...
+
+def notify_order_update(order_serialized_data):
+...sends type "order_update" with serialized order dict...
+
+def notify_map_preview(robot_id, image_base64):
+...sends type "map_preview" with robot_id and base64-encoded PNG string...
+
+These functions are called from:
+API views: after creating/cancelling orders, changing robot modes, starting/stopping scans.
+MQTT Listener: after processing system_status, pose, mission_status, map_preview, map_complete messages.
+
+4.4 Django MQTT Listener Service
+
+Runs as a separate long-lived process via custom management command:
+python manage.py run_mqtt_listener
+
+Must handle graceful shutdown: register signal handlers for SIGTERM and SIGINT that disconnect the MQTT client cleanly and close database connections.
+
+Reconnection: Configure reconnect_delay_set(min_delay=1, max_delay=60) on the paho-mqtt client so it automatically reconnects if the broker restarts.
+
+Subscriptions and Handlers:
+
+Topic: warehouse/robots/+/system_status
+Handler: Extract robot_id from topic. Inside transaction.atomic:
+Try Robot.objects.select_for_update().get(robot_id=robot_id).
+On DoesNotExist: Robot.objects.create(robot_id=robot_id, name=robot_id, system_status=payload, operational_mode='IDLE'). Log auto-creation.
+Update system_status from payload.
+On ONLINE: check for QUEUED_OFFLINE orders assigned to this robot and re-dispatch them (set status to IN_PROGRESS, publish cmd_auto). Call notify_robot_status().
+On OFFLINE: if robot had an IN_PROGRESS task, set order to QUEUED_OFFLINE. If robot had operational_mode MANUAL or SEMI_MANUAL, set to IDLE and clear controlled_by. Call notify_robot_status() and notify_order_update() as needed.
+
+Topic: warehouse/robots/+/pose
+Handler: Update Robot.pos_x, pos_y, yaw, last_seen. Throttled: max one DB write per 1 second per robot. Use an in-memory dictionary to track last DB write timestamp per robot_id. Always call notify_robot_pose() on every message (unthrottled, for smooth WebSocket delivery to frontend at full 5Hz rate).
+
+Topic: warehouse/robots/+/mission_status
+Handler: Inside transaction.atomic with select_for_update on both Robot and Order.
+First check idempotency: if the order exists and its status is not IN_PROGRESS, log a warning and ignore (handles duplicate QoS 1 deliveries).
+Check robot's operational_mode:
+If AUTO: standard order flow. On COMPLETED: set Order.status=COMPLETED, Order.completed_at=now(), Robot.operational_mode=IDLE, Robot.current_task=None. Then check for PENDING orders and auto-assign to this now-IDLE robot. On FAILED: same flow but Order.status=FAILED.
+If SEMI_MANUAL: ad-hoc click-to-navigate completed. On COMPLETED or FAILED: set Robot.operational_mode=MANUAL (not IDLE — user retains control lock). Robot.current_task remains None. controlled_by remains unchanged. Update the in-memory cmd_manual timestamp to current time (resets the 60-second auto-release timer).
+If robot has no current_task and mode is AUTO (ad-hoc navigation from system): set Robot.operational_mode=IDLE, Robot.current_task=None.
+Call notify_robot_mission(), notify_robot_mode(), and notify_order_update() as appropriate.
+
+Topic: warehouse/robots/+/cmd_manual
+Handler: Track last cmd_manual timestamp per robot in an in-memory dictionary. This is used for the manual control timeout check. The MQTT Listener subscribes to this topic because the Django ASGI server publishes cmd_manual on behalf of the frontend — the Listener sees these messages and tracks timing. Do not write to DB.
+
+Topic: warehouse/robots/+/map_complete
+Handler: Decode JSON payload containing map_name, map_image_base64, resolution, origin_x, origin_y, width_meters, height_meters. Decode the base64 image and save as a file. Create a new WarehouseMap record. Set Robot.operational_mode=IDLE, Robot.controlled_by=None inside transaction.atomic. Call notify_robot_mode().
+
+Topic: warehouse/robots/+/map_preview
+Handler: Extract robot_id. Call notify_map_preview(robot_id, base64_encode(payload)). The payload is binary PNG from the robot. Base64 encode it before sending to the Channels layer for WebSocket delivery. No DB write.
+
+Periodic Checks (run in a background thread every 30 seconds):
+
+The periodic check thread must call django.db.close_old_connections() at the beginning of each 30-second cycle to handle stale database connections.
+
+Manual Control Timeout: Check all robots with operational_mode='MANUAL' (NOT SEMI_MANUAL — robots in SEMI_MANUAL are autonomously navigating and not expected to receive cmd_manual). If the last cmd_manual timestamp (from in-memory dict) was more than 60 seconds ago, inside transaction.atomic with select_for_update: set operational_mode='IDLE', controlled_by=None. Publish "STOP" to cmd_manual topic. Call notify_robot_mode(). Log the auto-release.
+
+QUEUED_OFFLINE Reassignment: Check all orders with status='QUEUED_OFFLINE' and updated_at older than 10 minutes. Unassign the robot (set assigned_robot=None) and set status='PENDING' so any available robot can pick them up. Call notify_order_update().
+
+Last Seen Offline Detection: Check all robots with system_status='ONLINE' and last_seen older than 30 seconds. Set system_status='OFFLINE'. If robot had operational_mode MANUAL or SEMI_MANUAL, set to IDLE and clear controlled_by. Call notify_robot_status() and notify_robot_mode(). This catches cases where LWT does not fire.
+
+4.5 Concurrency and Race Condition Protection
+
+All state transitions on Robot and Order must use select_for_update() inside transaction.atomic().
+
+Example Pattern for API views:
+with transaction.atomic():
+robot = Robot.objects.select_for_update().get(robot_id=robot_id)
+if robot.operational_mode != 'IDLE':
+return Response({"error": "Robot is not IDLE"}, status=409)
+if robot.system_status != 'ONLINE':
+return Response({"error": "Robot is OFFLINE"}, status=409)
+robot.operational_mode = 'MANUAL'
+robot.controlled_by = request.user
+robot.save()
+
+Apply this pattern to: set_mode, navigate, order creation/assignment, order cancellation, map scan start/stop/cancel, map set_active, and every endpoint that mutates robot or order state.
+
+Active Map Constraint Enforcement:
+with transaction.atomic():
+WarehouseMap.objects.select_for_update().filter(is_active=True).update(is_active=False)
+map_obj = WarehouseMap.objects.select_for_update().get(id=map_id)
+map_obj.is_active = True
+map_obj.save()
+
+Active Map Change Guards:
+Before changing the active map, check:
+If any orders have status IN_PROGRESS: reject with 409 ("Cannot change active map while orders are in progress").
+If any robot has operational_mode MAPPING or AUTO: reject with 409 ("Cannot change active map while robots are active").
+If PENDING orders exist whose products have positions on the old active map but NOT on the new active map: include the count in the response metadata so the frontend can show a confirmation dialog. The actual cancellation is triggered by a separate confirmation step (see Section 9.4 for the set_active endpoint details).
+
+4.6 Order Auto-Assignment Logic
+
+When a new Order is created (POST /api/v1/orders/):
+Validate the product has a ProductPosition on the currently active map. If not, return 400.
+Find robots where system_status='ONLINE' AND operational_mode='IDLE'.
+For smart assignment: among all eligible robots, pick the one with the shortest Euclidean distance to the product location (using ProductPosition coordinates and Robot pos_x/pos_y from the database). If distance calculation is not possible (robot has no pose data yet), pick the first available.
+If found:
+order.assigned_robot = robot
+order.status = 'IN_PROGRESS'
+robot.operational_mode = 'AUTO'
+robot.current_task = order
+Save both inside transaction.atomic with select_for_update.
+Publish cmd_auto via MQTT (see Section 4.7).
+Call notify_order_update() and notify_robot_mode().
+If none found:
+order.status = 'PENDING'. Sits in queue.
+Call notify_order_update().
+
+When a robot becomes IDLE (mission complete, failure, cancellation, or manual release):
+Check for the oldest PENDING order (ordered by created_at).
+If found: Assign and dispatch using the same logic above.
+
+When a robot comes ONLINE:
+Check for QUEUED_OFFLINE orders assigned to this robot.
+If found: Re-dispatch. Set order status to IN_PROGRESS. Publish cmd_auto.
+
+4.7 Order Dispatch Payload
+
+Django publishes to warehouse/robots/{id}/cmd_auto:
+{
+"order_id": 42,
+"action": "NAVIGATE",
+"waypoints": [
+{"x": 5.0, "y": 3.0},
+{"x": 0.0, "y": 0.0}
+]
+}
+
+Waypoint 1: Product location (from ProductPosition for this product on the active map).
+Waypoint 2: Home position from active WarehouseMap (home_x, home_y).
+Robot navigates waypoints in sequence. Reports COMPLETED after the last one.
+Guards: Do NOT dispatch if operational_mode is MANUAL, SEMI_MANUAL, or MAPPING.
+
+For order cancellation of IN_PROGRESS orders, Django publishes:
+{
+"order_id": 42,
+"action": "CANCEL"
+}
+The robot stops navigation, halts in place, and does NOT publish mission_status. Django handles the state changes directly.
+
+For ad-hoc navigation (click-to-navigate from Manual Control, or system-initiated), Django publishes:
+{
+"order_id": null,
+"action": "NAVIGATE",
+"waypoints": [
+{"x": 5.0, "y": 3.0}
+]
+}
+Single waypoint, no return trip, no associated order.
+
+4.8 Django Channels Configuration
+
+ASGI Setup:
+Update settings.py to include 'channels' and 'daphne' in INSTALLED_APPS (daphne should be first).
+Set ASGI_APPLICATION = 'warehouse_project.asgi.application'.
+Configure CHANNEL_LAYERS:
+CHANNEL_LAYERS = {
+"default": {
+"BACKEND": "channels_redis.core.RedisChannelLayer",
+"CONFIG": {
+"hosts": [(REDIS_HOST, REDIS_PORT)],
+},
+},
+}
+
+ASGI routing (warehouse_project/asgi.py):
+Use ProtocolTypeRouter to route HTTP to Django's ASGI app and WebSocket to the dashboard consumer, wrapped in AuthMiddlewareStack (or a custom token auth middleware).
+
+WebSocket URL routing (api/routing.py):
+Route ws/dashboard/ to DashboardConsumer.
+
+4.9 WebSocket Consumer
+
+File: api/consumers.py
+
+Class: DashboardConsumer extends JsonWebsocketConsumer (synchronous).
+
+connect():
+Extract token from query string.
+Look up user via Token model. If invalid, close with code 4001.
+Attach user to self.scope.
+Add this connection to the "dashboard" Channels group.
+Accept the connection.
+
+disconnect(close_code):
+Remove from the "dashboard" Channels group.
+
+receive_json(content):
+Handle incoming messages from the frontend.
+Supported types:
+
+text
+
+"cmd_manual":
+    Extract robot_id and command (W/A/S/D/STOP).
+    Validate: Robot exists, robot.controlled_by == self.scope['user'], robot.operational_mode in ('MANUAL', 'MAPPING'), robot.system_status == 'ONLINE'.
+    If validation fails: send_json error message back to client.
+    If valid: MQTTPublisher.publish(f"warehouse/robots/{robot_id}/cmd_manual", command, qos=0).
+Group message handlers (called when messages arrive via the Channels layer):
+robot_pose(event): self.send_json({"type": "robot.pose", "robot_id": ..., "x": ..., "y": ..., "yaw": ...})
+robot_status(event): self.send_json({"type": "robot.status", "robot_id": ..., "system_status": ...})
+robot_mode(event): self.send_json({"type": "robot.mode", "robot_id": ..., "operational_mode": ..., "controlled_by": ...})
+robot_mission(event): self.send_json({"type": "robot.mission", "robot_id": ..., "status": ...})
+order_update(event): self.send_json({"type": "order.update", "order": ...})
+map_preview(event): self.send_json({"type": "map.preview", "robot_id": ..., "image_base64": ...})
+
+All connected clients receive all messages (no per-client filtering). With a small number of robots and users, this is acceptable.
+
+4.10 DRF Pagination
+
+Add to settings.py REST_FRAMEWORK config:
+DEFAULT_PAGINATION_CLASS: A custom subclass of rest_framework.pagination.PageNumberPagination with page_size_query_param = 'page_size' and max_page_size = 100.
+PAGE_SIZE: 20
+
+4.11 CORS
+
+Install django-cors-headers. Allow http://localhost:3000 in development via CORS_ALLOWED_ORIGINS in settings.py.
+
+SECTION 5: MQTT SPECIFICATION
+
+5.1 Broker Setup
+
+Broker: Eclipse Mosquitto.
+Listeners:
+Port 1883: Standard MQTT (for Python clients: Django listener, Django publisher, mock robot).
+Port 9001: WebSocket. Note: this port is no longer used by the frontend. It remains available for debugging/monitoring tools (e.g., MQTT Explorer).
+Authentication: Username/password via Mosquitto password_file. Credentials in .env.
+Message size limit: Set message_size_limit to 10485760 (10MB) in mosquitto.conf to accommodate large map images.
+
+Provide a mosquitto.conf file in the repo:
+listener 1883
+listener 9001
+protocol websockets
+allow_anonymous false
+password_file /mosquitto/config/passwd
+acl_file /mosquitto/config/acl
+message_size_limit 10485760
+
+ACL Configuration (mosquitto_acl file):
+Two MQTT user types (frontend_user has been eliminated):
+
+text
+
+django_user: Can publish to warehouse/robots/+/cmd_auto, warehouse/robots/+/cmd_manual, warehouse/robots/+/cmd_mapping. Can subscribe to warehouse/# (all topics).
+robot_user: Can publish to warehouse/robots/+/system_status, warehouse/robots/+/pose, warehouse/robots/+/mission_status, warehouse/robots/+/map_preview, warehouse/robots/+/map_complete. Can subscribe to warehouse/robots/+/cmd_auto, warehouse/robots/+/cmd_manual, warehouse/robots/+/cmd_mapping.
+5.2 QoS and Retained Messages
+
+Topic: .../system_status | Direction: Robot -> Broker | QoS: 1 | Retained: Yes
+Topic: .../pose | Direction: Robot -> Broker | QoS: 0 | Retained: No
+Topic: .../mission_status | Direction: Robot -> Broker | QoS: 1 | Retained: No
+Topic: .../cmd_auto | Direction: Django -> Robot | QoS: 1 | Retained: No
+Topic: .../cmd_manual | Direction: Django -> Robot | QoS: 0 | Retained: No
+Topic: .../cmd_mapping | Direction: Django -> Robot | QoS: 1 | Retained: No
+Topic: .../map_preview | Direction: Robot -> Django Listener | QoS: 0 | Retained: No
+Topic: .../map_complete | Direction: Robot -> Django Listener | QoS: 1 | Retained: No
+
+5.3 Complete Topic Reference
+
+Connection and Status (Robot -> Backend):
+
+warehouse/robots/{id}/system_status
+Payload: "ONLINE" or "OFFLINE" or "ERROR"
+Set by: Robot publishes ONLINE on connect. LWT publishes OFFLINE on unexpected disconnect. Robot publishes ERROR on hardware fault.
+Consumed by: Django MQTT Listener -> updates Robot.system_status -> pushes to WebSocket.
+
+Telemetry (Robot -> Backend -> Frontend):
+
+warehouse/robots/{id}/pose
+Payload: {"x": 5.2, "y": 3.1, "yaw": 1.57}
+Rate: 5 Hz (every 200ms).
+Consumed by: Django MQTT Listener -> throttled DB write every 1 second -> pushes to WebSocket at full 5Hz rate (unthrottled) for smooth frontend rendering.
+
+warehouse/robots/{id}/mission_status
+Payload: "COMPLETED" or "FAILED"
+When: Robot finishes or fails a navigation mission.
+Consumed by: Django MQTT Listener -> updates Order and Robot -> pushes to WebSocket.
+
+Commands (Django -> Robot):
+
+warehouse/robots/{id}/cmd_auto
+Payload: {"order_id": 42 or null, "action": "NAVIGATE" or "CANCEL", "waypoints": [{"x":5.0,"y":3.0}, {"x":0.0,"y":0.0}]}
+The waypoints field is present only when action is "NAVIGATE".
+Sent by: Django on order dispatch, order cancellation, click-to-navigate, or ad-hoc navigation.
+
+warehouse/robots/{id}/cmd_manual
+Payload: "W" or "A" or "S" or "D" or "STOP"
+Sent by: Django ASGI server (WebSocket consumer forwards from frontend after validation).
+Semantics:
+W = Forward at fixed linear velocity.
+S = Backward at fixed linear velocity.
+A = Rotate left in place at fixed angular velocity.
+D = Rotate right in place at fixed angular velocity.
+STOP = Halt all movement.
+
+warehouse/robots/{id}/cmd_mapping
+Payload: {"action": "START_MANUAL"} or {"action": "START_AUTO"} or {"action": "STOP_AND_SAVE", "map_name": "Warehouse A"} or {"action": "CANCEL"}
+Sent by: Django on scan start/stop/cancel.
+
+Mapping (Robot -> Backend):
+
+warehouse/robots/{id}/map_preview
+Payload: Binary compressed PNG (~50-200KB).
+Rate: ~1 Hz during active scanning.
+Consumed by: Django MQTT Listener -> base64 encodes -> pushes to WebSocket.
+
+warehouse/robots/{id}/map_complete
+Payload: JSON string containing map_name, map_image_base64, resolution, origin_x, origin_y, width_meters, height_meters.
+When: Robot finalizes SLAM after STOP_AND_SAVE.
+Consumed by: Django MQTT Listener -> saves WarehouseMap record.
+
+SECTION 6: WEBSOCKET SPECIFICATION
+
+6.1 Connection
+
+URL: ws://localhost:8000/ws/dashboard/?token=<auth_token>
+Protocol: JSON messages (text frames). Binary data (map previews) is base64-encoded within JSON.
+Reconnection: Frontend reconnects automatically after 5 seconds on disconnect.
+
+6.2 Server -> Client Message Types
+
+Robot Pose:
+{"type": "robot.pose", "robot_id": "R1", "x": 5.2, "y": 3.1, "yaw": 1.57}
+Rate: 5Hz per robot (forwarded from MQTT at full rate).
+
+Robot System Status:
+{"type": "robot.status", "robot_id": "R1", "system_status": "ONLINE"}
+When: Robot comes online, goes offline, or reports error.
+
+Robot Operational Mode:
+{"type": "robot.mode", "robot_id": "R1", "operational_mode": "MANUAL", "controlled_by": "admin"}
+When: Any mode transition occurs. controlled_by is the username or null.
+
+Robot Mission Result:
+{"type": "robot.mission", "robot_id": "R1", "status": "COMPLETED"}
+When: Robot completes or fails a navigation mission.
+
+Order Update:
+{"type": "order.update", "order": {"id": 42, "product_sku": "SKU-001", "product_name": "Widget", "assigned_robot": "R1", "status": "COMPLETED", "created_at": "...", "completed_at": "..."}}
+When: Any order state change (created, assigned, completed, failed, cancelled, queued_offline).
+
+Map Preview:
+{"type": "map.preview", "robot_id": "R1", "image_base64": "<base64 PNG string>"}
+Rate: ~1Hz during active scanning.
+
+6.3 Client -> Server Message Types
+
+Manual Control Command:
+{"type": "cmd_manual", "robot_id": "R1", "command": "W"}
+Rate: Every 100ms while a key is held (heartbeat pattern).
+Server validates: robot exists, user has control (controlled_by == user), robot in MANUAL or MAPPING mode, robot ONLINE. On failure, server sends back:
+{"type": "error", "message": "Not controlling this robot"}
+
+SECTION 7: FRONTEND ARCHITECTURE
+
+7.1 Theme and Styling
+
+"Clean Industrial" aesthetic using MUI ThemeProvider.
+Dark/Light mode toggle via Switch in the Navbar.
+Use MUI components exclusively (DataGrid, Cards, Tabs, Snackbar, Drawer, etc.).
+Persist theme preference in localStorage.
+Show MUI Snackbar toasts for all important events: order created, order completed, order failed, robot offline, robot online, scan complete, manual control taken/released, auto-release, navigation arrived, navigation failed, errors.
+
+7.2 Layout
+
+Top Navbar: App title ("Warehouse Control"), Dark/Light toggle, user avatar with logout.
+Left Sidebar: Collapsible MUI Drawer with navigation links:
+Dashboard
+Live Map
+Manual Control
+Inventory
+Orders
+
+7.3 State Management (React Contexts)
+
+Three contexts, provided at the App level wrapped in this order:
+ThemeContext (outermost) -> WebSocketContext -> RobotContext (innermost) -> App/Routes.
+
+WebSocketContext:
+Creates a single native WebSocket connection to ws://<API_HOST>/ws/dashboard/?token=<token> when the auth token is available.
+Connects when the user logs in. Disconnects on logout.
+Provides:
+subscribe(messageType, callback): registers a callback for a specific message type. Returns an unsubscribe function.
+sendMessage(data): sends a JSON message to the server.
+isConnected: boolean state.
+Implements automatic reconnection with 5-second delay.
+On receiving a message, parses the JSON and calls all callbacks registered for that message's type.
+
+RobotContext:
+Subscribes to robot.pose, robot.status, robot.mode, robot.mission via WebSocketContext.
+Uses useRef for high-frequency pose data (robotPositions ref — consumed by canvas, no React re-renders on pose updates).
+Uses useState for robot status and mode data (triggers re-renders for DataGrids, status chips, dropdowns).
+On receiving robot.mission, shows a toast notification ("Order #42 completed!" or "Navigation failed for R1").
+Provides: robots (state object with status/mode per robot), robotPositions (ref), selectedRobot (state for Manual Control).
+
+ThemeContext: Manages Dark/Light mode toggle. Persists to localStorage.
+
+7.4 React Environment Variables
+
+Required frontend variables (Create React App format):
+REACT_APP_API_URL=http://localhost:8000
+
+If using Vite, prefix with VITE_ instead.
+
+Note: No MQTT variables needed in the frontend. All real-time communication goes through the Django WebSocket. MQTT credentials remain server-side only.
+
+7.5 Coordinate Conversion
+
+All coordinate conversion uses the active map's config. Fetch once on app load via GET /api/v1/maps/active/ and cache in a ref or state. Refetch when the active map changes.
+
+Meters to Canvas Pixels:
+px = (mx - origin_x) / resolution
+py = image_height_px - ((my - origin_y) / resolution)
+
+Canvas Pixels to Meters:
+mx = px * resolution + origin_x
+my = (image_height_px - py) * resolution + origin_y
+
+7.6 Reusable MapCanvas Component
+
+File: src/components/MapCanvas.jsx
+
+A reusable HTML5 Canvas component used on both the Live Map and Manual Control pages. Props:
+
+mapData: Active map object (image URL, resolution, origin, dimensions). Required.
+robotPositions: Ref containing current robot positions. Required.
+robots: State object with robot status/mode for coloring. Required.
+products: Array of product positions to render as markers. Optional.
+showHome: Boolean, whether to render the home position marker. Default true.
+highlightedRobotId: Robot ID to highlight (larger, pulsing, or brighter). Optional (used on Manual Control).
+targetPosition: {x, y} in meters to show a destination marker (for SEMI_MANUAL). Optional.
+onMapClick: Callback function (metersX, metersY) called when user clicks a free space on the map. If null, clicking is disabled. Used for click-to-navigate on Manual Control and right-click-set-home on Live Map.
+onRightClick: Callback function (metersX, metersY) called on right-click. Used for "Set as Home" on Live Map.
+
+Rendering features:
+Static map image as background (loaded once, reloaded only on active map change).
+Robot arrows: colored arrow-shaped triangles pointing in direction of yaw. Distinct color per robot (by index or robot_id hash). Label with robot_id.
+Product markers: small colored circles with name labels.
+Home position marker: distinct icon/shape (house icon or marked square), labeled "Home".
+Target destination marker: pulsing circle or crosshair at the target position (shown during SEMI_MANUAL).
+
+Rendering — Game Loop with Interpolation:
+MQTT/WebSocket pose callback (runs on message receive — NEVER draw here, NEVER trigger React re-render):
+robotPositions.current[id] = {
+prevX: oldTargetX, prevY: oldTargetY, prevYaw: oldTargetYaw,
+targetX: newX, targetY: newY, targetYaw: newYaw,
+timestamp: Date.now()
+}
+
+text
+
+Animation Loop (requestAnimationFrame, ~60 FPS):
+    Clear canvas.
+    For each robot in robotPositions.current:
+        t = clamp((Date.now() - timestamp) / 200, 0, 1)
+        drawnX = lerp(prevX, targetX, t)
+        drawnY = lerp(prevY, targetY, t)
+        drawnYaw = lerpAngle(prevYaw, targetYaw, t)
+        Convert (drawnX, drawnY) to canvas pixels using coordinate conversion.
+        Draw arrow at (px, py) rotated by drawnYaw.
+    Draw product markers (static, no interpolation needed).
+    Draw home marker (static).
+    Draw target marker if present (static with pulse animation).
+
+This produces smooth movement even though WebSocket data arrives at 5Hz.
+Click handling:
+On click: read pixel value at clicked location from the map image (use an offscreen canvas with the map image for pixel sampling). If pixel value <= 200 (wall/unknown), show error toast "Cannot navigate to a wall." If pixel value > 200 (free space), call onMapClick with meter coordinates.
+Cursor: change to "crosshair" over free space, "not-allowed" over walls. Use mousemove to sample pixels and update cursor dynamically.
+
+7.7 Loading, Empty, and Error States
+
+Every page must handle three states:
+Loading: MUI Skeleton components or CircularProgress while API data loads.
+Empty: Descriptive message with icon. E.g., "No orders yet — create one from the Orders page", "No robots connected — start a mock robot", "No maps found — scan your warehouse".
+Error: "Failed to load data" with a Retry button.
+
+SECTION 8: PAGE-BY-PAGE REQUIREMENTS
+
+8.1 Dashboard
+
+Stats Cards (top row, MUI Cards):
+Active Robots (count of robots with system_status = 'ONLINE').
+Robots in Error (count of robots with system_status = 'ERROR').
+Pending Orders (count of orders with status = 'PENDING').
+Completed Orders Today (count of orders with status = 'COMPLETED' and completed_at date = today).
+Source: GET /api/v1/dashboard/stats/
+
+Robot Status Table (MUI DataGrid):
+Columns: Robot ID, Name, System Status (colored chip: green=ONLINE, red=OFFLINE, orange=ERROR), Operational Mode (with SEMI_MANUAL shown as "Semi-Manual" or "Auto-Moving"), Controlled By (username or dash), Current Task (order ID or dash), Last Seen (relative time: "5s ago", "2m ago").
+Source: GET /api/v1/robots/
+Updates reactively when RobotContext state changes (robot.status and robot.mode WebSocket messages).
+
+Recent Orders Table (MUI DataGrid):
+Columns: Order ID, Product Name, Assigned Robot, Status (colored chip: blue=PENDING, yellow=QUEUED_OFFLINE, green=IN_PROGRESS, dark green=COMPLETED, red=FAILED, gray=CANCELLED), Created At.
+Shows 10 most recent. Source: GET /api/v1/orders/?page_size=10&ordering=-created_at
+Updates reactively on order.update WebSocket messages.
+
+8.2 Live Map
+
+Two tabs (MUI Tabs):
+
+Tab 1: Live View
+
+text
+
+Uses the MapCanvas component (Section 7.6) with:
+    mapData: active map from GET /api/v1/maps/active/
+    robotPositions: from RobotContext ref
+    robots: from RobotContext state
+    products: from GET /api/v1/product-positions/?map=<active_map_id>
+    showHome: true
+    highlightedRobotId: null (no highlighting)
+    targetPosition: null (no target)
+    onMapClick: null (no click-to-navigate on this page)
+    onRightClick: handler for "Set as Home Position"
+
+Right-click Context Menu:
+    Right-clicking on the map canvas opens a custom MUI Menu anchored at the click position.
+    Menu item: "Set as Home Position".
+    On click: convert pixel to meters. Call PUT /api/v1/maps/{active_map_id}/ with {home_x, home_y}. Show toast "Home position updated." Home marker on map updates immediately.
+Tab 2: Map Management
+
+text
+
+Default State — Map Library:
+MUI DataGrid or Card grid listing all saved maps.
+Columns: Map Name, Scanned By (robot name), Resolution, Dimensions (W x H meters), Product Count (count of ProductPositions associated with this map), Home Position (home_x, home_y), Date Created, Active indicator (green chip or star icon).
+Actions per map:
+    "Set Active": triggers confirmation flow (see below).
+    "Edit": opens dialog with fields: Map Name, Home X, Home Y. Saves via PUT /api/v1/maps/{id}/.
+    "Delete": DELETE /api/v1/maps/{id}/. Cannot delete the active map (show error toast). Confirmation dialog before deletion.
+Map thumbnail preview on hover or click.
+"+ New Scan" button (top right, prominent).
+
+Set Active Confirmation Flow:
+1. User clicks "Set Active" on a non-active map.
+2. Frontend calls POST /api/v1/maps/{id}/set_active/ with {confirm: false} (preview mode).
+3. Backend checks for pending orders that would be cancelled and returns {pending_cancel_count: X, blocked: true/false, block_reason: "..."}.
+4. If blocked (IN_PROGRESS orders or active robots): show error dialog with the reason.
+5. If not blocked and pending_cancel_count > 0: show confirmation dialog: "Changing the active map will cancel X pending orders. Are you sure?" with [Cancel] [Yes, Switch Map].
+6. If not blocked and pending_cancel_count == 0: show simple confirmation: "Set this map as active?" with [Cancel] [Yes].
+7. On confirm: POST /api/v1/maps/{id}/set_active/ with {confirm: true}. Backend performs the switch and cancels pending orders. Returns success with cancelled_count.
+8. Frontend shows toast: "Map activated. X orders cancelled." or "Map activated."
+
+Scanning Mode (after clicking "+ New Scan"):
+Layout:
+    Top: Robot Dropdown (IDLE + ONLINE robots only), Mode Toggle (Manual/Autonomous), Map Name Input field, Start Button.
+    Center: Scanning Canvas showing live map preview (updates ~1Hz from map.preview WebSocket messages) with robot position dot overlay (updates 5Hz from robot.pose WebSocket messages).
+    Right side: WASD Controls (visible in Manual mode only, hidden in Autonomous mode).
+    Bottom: Status text showing current scanning state, "Save Map" button, "Discard and Cancel" button.
+
+Scanning Workflow:
+1. User selects an IDLE robot from the dropdown, chooses scan mode (Manual or Autonomous), enters a map name.
+2. Clicks "Start Scanning."
+3. React calls POST /api/v1/maps/start_scan/ with {robot_id, mode, map_name}.
+4. Django validates robot is IDLE + ONLINE using select_for_update. Sets operational_mode='MAPPING', controlled_by=request.user. Publishes cmd_mapping with {"action": "START_MANUAL"} or {"action": "START_AUTO"}. Returns 200.
+5. During scanning:
+    Robot publishes map_preview at ~1Hz. Django Listener base64 encodes and pushes to WebSocket. React renders it on the scanning canvas.
+    Robot publishes pose at 5Hz. Django Listener pushes to WebSocket. React shows robot position dot on the scanning canvas.
+    In Manual mode: WASD keyboard controls appear. User drives robot. Frontend sends cmd_manual via WebSocket with the same heartbeat pattern used on Manual Control page (see Section 8.3).
+    In Autonomous mode: WASD controls are hidden. Robot explores on its own. User watches the map build in real-time.
+6. "Save Map" clicked:
+    React calls POST /api/v1/maps/stop_scan/ with {robot_id, map_name}.
+    Django publishes cmd_mapping with {"action": "STOP_AND_SAVE", "map_name": "..."}.
+    Robot finalizes map processing and publishes map_complete.
+    Django Listener saves the new WarehouseMap record. Sets Robot.operational_mode='IDLE', Robot.controlled_by=None. Calls notify_robot_mode(). Frontend receives robot.mode update via WebSocket, exits scanning mode, shows toast "Map saved successfully!", refreshes the map library list.
+7. "Discard and Cancel" clicked:
+    React calls POST /api/v1/maps/cancel_scan/ with {robot_id}.
+    Django publishes cmd_mapping with {"action": "CANCEL"}.
+    Robot discards accumulated map data and stops scanning.
+    Django sets Robot.operational_mode='IDLE', Robot.controlled_by=None inside transaction.atomic with select_for_update. Calls notify_robot_mode().
+    Frontend exits scanning mode, shows toast "Scan cancelled."
+
+Autonomous Mapping Note:
+Autonomous mapping relies on the mock robot's exploration algorithm (a simplified frontier-based approach). In a real deployment, the robot's ROS 2 nav stack would handle SLAM and exploration. For the graduation project, the mock robot simulates this by incrementally revealing the map image in expanding circles from the robot's starting position. This is a visual approximation only — the mock robot does not run actual SLAM.
+
+Map Preview Memory Leak Prevention:
+The scanning canvas updates at ~1Hz with new base64 PNG images. Each image creates a new Image object for the canvas. To prevent memory leaks:
+Revoke or release the previous image reference before assigning the new one.
+Use a single Image object instance, updating its src property rather than creating new objects.
+Clean up on component unmount (clear any pending image loads, cancel animation frames).
+
+8.3 Manual Control
+
+Layout:
+Left side (70% width): MapCanvas component showing the active map with all robots, products, home position, and a highlighted indicator for the controlled robot.
+Right side (30% width): Control panel with robot selection, status display, WASD controls, and action buttons.
+
+Control Panel (right side):
+Robot Selector: MUI Select dropdown listing robots that are ONLINE. Shows robot_id and name. Disabled while controlling a robot.
+Status Display: Shows the selected robot's current operational_mode, system_status, position (x, y, yaw), and controlled_by username.
+"Take Control" Button: Visible when no robot is being controlled by this user. Calls PUT /api/v1/robots/{id}/set_mode/ with {mode: "MANUAL"}. On success, WASD controls activate. Toast: "Now controlling R1."
+"Release Control" Button: Visible when user is controlling a robot. Calls PUT /api/v1/robots/{id}/set_mode/ with {mode: "IDLE"}. If robot is in SEMI_MANUAL, backend cancels active navigation first. Clears controlled_by. Toast: "Released control of R1."
+WASD Controls: Four directional buttons arranged in a cross layout plus a center STOP button. Visually styled as industrial control buttons. Enabled only when robot operational_mode is MANUAL or MAPPING. Grayed out and disabled when in SEMI_MANUAL (robot is auto-navigating to clicked point).
+"Cancel Auto-Move" Button: Visible only when robot is in SEMI_MANUAL. Calls PUT /api/v1/robots/{id}/set_mode/ with {mode: "MANUAL"}. Backend publishes CANCEL to cmd_auto, sets mode to MANUAL, keeps controlled_by. Toast: "Auto-navigation cancelled."
+
+MapCanvas Configuration (left side):
+mapData: active map from cached GET /api/v1/maps/active/
+robotPositions: from RobotContext ref
+robots: from RobotContext state
+products: from GET /api/v1/product-positions/?map=<active_map_id>
+showHome: true
+highlightedRobotId: the robot currently controlled by this user (or null)
+targetPosition: the clicked destination coordinates when in SEMI_MANUAL (or null)
+onMapClick: handler for click-to-navigate (only active when user is controlling a robot in MANUAL or SEMI_MANUAL mode)
+onRightClick: null (no right-click menu on this page)
+
+Click-to-Navigate Flow:
+1. User is controlling a robot (operational_mode is MANUAL or SEMI_MANUAL).
+2. User clicks on the map canvas.
+3. MapCanvas checks the pixel value at the clicked location. If wall (pixel <= 200), show error toast "Cannot navigate to a wall." and do nothing.
+4. If free space (pixel > 200), convert pixel to meters and call POST /api/v1/robots/{id}/navigate/ with {x, y}.
+5. Backend validates: robot exists, controlled_by == user, operational_mode in (MANUAL, SEMI_MANUAL), system_status == ONLINE. If robot is already in SEMI_MANUAL (already navigating), the new NAVIGATE command replaces the current one (robot handles path switching internally).
+6. Backend sets operational_mode='SEMI_MANUAL' (if not already), publishes cmd_auto with {order_id: null, action: "NAVIGATE", waypoints: [{x, y}]}.
+7. Frontend receives robot.mode WebSocket update: disables WASD controls, shows "Cancel Auto-Move" button, displays target destination marker on the map.
+8. When robot arrives (robot.mission WebSocket message with status COMPLETED): backend sets mode back to MANUAL (controlled_by unchanged). Frontend re-enables WASD, removes target marker, hides "Cancel Auto-Move" button. Toast: "Robot arrived at destination."
+9. When robot fails (robot.mission with status FAILED): same transition back to MANUAL. Toast: "Navigation failed — path blocked."
+
+Keyboard Input — First-Key-Wins with Heartbeat:
+The frontend tracks which movement key is currently active. Only ONE direction can be active at a time.
+
+Key Down Handler:
+If no key is currently active:
+    Set the pressed key (W/A/S/D) as the active key.
+    Immediately send the command via WebSocket: {type: "cmd_manual", robot_id: "R1", command: "W"}.
+    Start a 100ms setInterval that repeatedly sends the same command (heartbeat to keep robot moving).
+If a different key is already active:
+    Ignore the new key press entirely. The first key wins until it is released.
+If the same key is pressed again (key repeat from OS):
+    Ignore. The interval is already running.
+
+Key Up Handler:
+If the released key matches the currently active key:
+    Clear the interval.
+    Send STOP command: {type: "cmd_manual", robot_id: "R1", command: "STOP"}.
+    Clear the active key state. The system is now ready for a new key press.
+If the released key does not match the active key:
+    Ignore (this key was never accepted).
+
+This produces clean, predictable behavior: hold W to go forward, release to stop. Press A while holding W — nothing happens. Release W to stop, then press A to turn.
+
+WASD controls are only active when:
+The user is controlling a robot (controlled_by == current user).
+The robot operational_mode is MANUAL or MAPPING (NOT SEMI_MANUAL).
+The robot system_status is ONLINE.
+The Manual Control page is focused (add/remove event listeners on page mount/unmount).
+
+Visual WASD Buttons:
+The on-screen buttons mirror keyboard behavior. On mousedown, start the heartbeat. On mouseup or mouseleave, send STOP and clear the interval. Only one button can be active at a time (disable others while one is pressed).
+
+8.4 Inventory
+
+Two sub-sections on the same page, arranged as top/bottom or tabs:
+
+Products Section:
+MUI DataGrid listing all products.
+Columns: SKU, Product Name, Positions Count (number of maps this product has positions on), Updated At.
+"+ Add Product" button opens a dialog: SKU (text input), Name (text input). POST /api/v1/products/.
+Row actions: Edit (dialog with Name field, PUT /api/v1/products/{sku}/), Delete (confirmation dialog, DELETE /api/v1/products/{sku}/ — will fail with 409 if product has orders due to PROTECT constraint, show error toast).
+
+Product Positions Section:
+Visible below the products table or as a second tab.
+Filter: MUI Select dropdown to choose a map (defaults to active map). Fetches GET /api/v1/product-positions/?map={map_id}.
+MUI DataGrid listing positions for the selected map.
+Columns: Product SKU, Product Name, Position X (meters), Position Y (meters), Actions.
+"+ Add Position" button opens a dialog: Product dropdown (products that do NOT already have a position on this map), Position X, Position Y. POST /api/v1/product-positions/.
+Row actions: Edit (dialog with X, Y fields, PUT /api/v1/product-positions/{id}/), Delete (confirmation, DELETE /api/v1/product-positions/{id}/).
+Visual aid: Consider showing a mini-map preview with existing product positions marked, and allowing click-to-place for new positions (converts pixel to meters). This is a nice-to-have enhancement.
+
+8.5 Orders
+
+Order Creation (top section):
+MUI Card with form fields:
+Product: MUI Autocomplete dropdown listing products that have a ProductPosition on the currently active map. If no active map is set, show an info message "Set an active map before creating orders."
+Quantity display: Show the product's position on the active map (X, Y) as read-only info.
+"Create Order" button: POST /api/v1/orders/ with {product_sku: "SKU-001"}.
+On success: Toast "Order #42 created" (or "Order #42 created and assigned to R1" if auto-assigned).
+
+Orders Table (below):
+MUI DataGrid with server-side pagination.
+Columns: Order ID, Product (SKU + Name), Assigned Robot, Status (colored chip), Created At, Completed At, Actions.
+Status chip colors: PENDING=blue, QUEUED_OFFLINE=yellow, IN_PROGRESS=green, COMPLETED=dark green, FAILED=red, CANCELLED=gray.
+Actions column: "Cancel" button visible only for PENDING and IN_PROGRESS orders. Confirmation dialog before cancellation. POST /api/v1/orders/{id}/cancel/.
+Filtering: MUI Select for status filter. Text field for product search. Date range picker for created_at.
+Sorting: Clickable column headers. Default sort: created_at descending.
+Source: GET /api/v1/orders/?status={filter}&page={n}&page_size={size}&ordering={field}
+Real-time updates: On order.update WebSocket message, update the matching row in the local data or refetch the current page.
+
+SECTION 9: API REFERENCE
+
+All endpoints are prefixed with /api/v1/. All except /auth/login/ and /health/ require Token authentication.
+
+9.1 Authentication
+
+POST /api/v1/auth/login/
+Body: {username, password}
+Response 200: {token, user_id, username}
+Response 400: {error: "Invalid credentials"}
+
+9.2 Health Check
+
+GET /api/v1/health/
+No authentication required.
+Response 200: {status: "ok", timestamp: "..."}
+Used for monitoring and container health checks.
+
+9.3 Dashboard
+
+GET /api/v1/dashboard/stats/
+Response 200: {active_robots: int, error_robots: int, pending_orders: int, completed_today: int}
+Computed via aggregate queries. No caching needed for the graduation project.
+
+9.4 Robots
+
+GET /api/v1/robots/
+Response 200: Paginated list of all robots with fields: robot_id, name, system_status, operational_mode, controlled_by (username or null), current_task (order ID or null), pos_x, pos_y, yaw, last_seen, updated_at.
+
+GET /api/v1/robots/{robot_id}/
+Response 200: Single robot detail.
+
+PUT /api/v1/robots/{robot_id}/set_mode/
+Body: {mode: "MANUAL" | "IDLE"}
+Logic (all inside transaction.atomic with select_for_update):
+Request mode MANUAL:
+    If robot.system_status != ONLINE: return 409.
+    If robot.operational_mode not in (IDLE,): return 409 ("Robot is not available").
+    If robot.controlled_by is not null and robot.controlled_by != request.user: return 409 ("Robot controlled by another user").
+    Set operational_mode='MANUAL', controlled_by=request.user.
+    Call notify_robot_mode().
+    Response 200: updated robot data.
+
+Request mode IDLE:
+    If robot.controlled_by != request.user and robot.controlled_by is not null: return 403 ("Not your robot").
+    If robot.operational_mode == 'SEMI_MANUAL':
+        Publish cmd_auto CANCEL to stop navigation: {order_id: null, action: "CANCEL"}.
+    If robot.operational_mode in ('MANUAL', 'SEMI_MANUAL'):
+        Publish cmd_manual STOP.
+    Set operational_mode='IDLE', controlled_by=None.
+    Call notify_robot_mode().
+    Response 200: updated robot data.
+
+POST /api/v1/robots/{robot_id}/navigate/
+Body: {x: float, y: float}
+Logic (inside transaction.atomic with select_for_update):
+Validate robot exists. Return 404 if not.
+Validate robot.system_status == 'ONLINE'. Return 409 if not.
+Validate robot.controlled_by == request.user. Return 403 if not.
+Validate robot.operational_mode in ('MANUAL', 'SEMI_MANUAL'). Return 409 if not.
+Set robot.operational_mode = 'SEMI_MANUAL'. Save.
+Publish to cmd_auto: {order_id: null, action: "NAVIGATE", waypoints: [{x, y}]}.
+Call notify_robot_mode().
+Response 200: updated robot data.
+
+9.5 Maps
+
+GET /api/v1/maps/
+Response 200: Paginated list of all maps with fields: id, name, scanned_by (robot_id or null), map_image (URL), resolution, origin_x, origin_y, width_meters, height_meters, home_x, home_y, is_active, created_at, updated_at.
+
+GET /api/v1/maps/active/
+Response 200: Single active map object with all fields. Returns the map where is_active=True.
+Response 404: {error: "No active map set"}.
+
+GET /api/v1/maps/{id}/
+Response 200: Single map detail.
+
+PUT /api/v1/maps/{id}/
+Body: {name: string (optional), home_x: float (optional), home_y: float (optional)}
+Only name, home_x, and home_y are editable. Map image, resolution, origin, and dimensions are locked after scanning.
+Response 200: Updated map object.
+
+DELETE /api/v1/maps/{id}/
+Cannot delete the active map. Return 409 if is_active=True.
+Deletes associated ProductPositions via CASCADE.
+Response 204: No content.
+
+POST /api/v1/maps/{id}/set_active/
+Body: {confirm: boolean}
+Logic (inside transaction.atomic with select_for_update on all maps and relevant robots/orders):
+
+Step 1 — Validation:
+    Check no robot has operational_mode in ('AUTO', 'MAPPING'). If any do, return 409: {blocked: true, block_reason: "Cannot change active map while robots are active."}.
+    Check no order has status 'IN_PROGRESS'. If any do, return 409: {blocked: true, block_reason: "Cannot change active map while orders are in progress."}.
+
+Step 2 — Count affected orders:
+    Find PENDING orders whose product does NOT have a ProductPosition on the target map.
+    Let pending_cancel_count = count of these orders.
+
+Step 3 — Preview vs Confirm:
+    If confirm is false (preview):
+        Return 200: {pending_cancel_count: int, blocked: false}.
+    If confirm is true (execute):
+        Cancel the affected PENDING orders (set status='CANCELLED'). Call notify_order_update() for each.
+        Deactivate all maps: WarehouseMap.objects.select_for_update().filter(is_active=True).update(is_active=False).
+        Activate the target map: set is_active=True.
+        Return 200: {success: true, cancelled_count: int}.
+
+POST /api/v1/maps/start_scan/
+Body: {robot_id: string, mode: "manual" | "autonomous", map_name: string}
+Logic (inside transaction.atomic with select_for_update):
+    Validate robot exists, system_status=='ONLINE', operational_mode=='IDLE'.
+    Set robot.operational_mode='MAPPING', robot.controlled_by=request.user. Save.
+    Publish cmd_mapping: {action: "START_MANUAL"} or {action: "START_AUTO"} based on mode.
+    Call notify_robot_mode().
+    Response 200: {status: "scanning started"}.
+
+POST /api/v1/maps/stop_scan/
+Body: {robot_id: string, map_name: string}
+Logic (inside transaction.atomic with select_for_update):
+    Validate robot exists, operational_mode=='MAPPING', controlled_by==request.user.
+    Publish cmd_mapping: {action: "STOP_AND_SAVE", map_name: map_name}.
+    Note: Robot remains in MAPPING mode until map_complete is received by MQTT Listener, which then sets IDLE.
+    Response 200: {status: "save requested"}.
+
+POST /api/v1/maps/cancel_scan/
+Body: {robot_id: string}
+Logic (inside transaction.atomic with select_for_update):
+    Validate robot exists, operational_mode=='MAPPING', controlled_by==request.user.
+    Publish cmd_mapping: {action: "CANCEL"}.
+    Set robot.operational_mode='IDLE', robot.controlled_by=None. Save.
+    Call notify_robot_mode().
+    Response 200: {status: "scan cancelled"}.
+
+9.6 Products
+
+GET /api/v1/products/
+Response 200: Paginated list. Fields: sku, name, positions_count (annotated count of ProductPosition records), updated_at.
+
+POST /api/v1/products/
+Body: {sku: string, name: string}
+Response 201: Created product object.
+Response 400: Validation errors.
+
+GET /api/v1/products/{sku}/
+Response 200: Product detail with nested positions list.
+
+PUT /api/v1/products/{sku}/
+Body: {name: string}
+SKU is immutable.
+Response 200: Updated product.
+
+DELETE /api/v1/products/{sku}/
+Returns 409 if the product has associated orders (PROTECT constraint). Show message: "Cannot delete product with order history."
+Response 204: No content.
+
+9.7 Product Positions
+
+GET /api/v1/product-positions/
+Query params: map (required, map ID to filter by).
+Response 200: List of positions for that map. Fields: id, product (sku, name), map (id, name), pos_x, pos_y.
+
+POST /api/v1/product-positions/
+Body: {product_sku: string, map_id: int, pos_x: float, pos_y: float}
+Validates unique_together(product, map). Returns 400 if duplicate.
+Response 201: Created position object.
+
+PUT /api/v1/product-positions/{id}/
+Body: {pos_x: float, pos_y: float}
+Product and map are immutable after creation.
+Response 200: Updated position.
+
+DELETE /api/v1/product-positions/{id}/
+Response 204: No content.
+
+9.8 Orders
+
+GET /api/v1/orders/
+Query params: status (filter), ordering (field name, prefix with - for descending), page, page_size.
+Response 200: Paginated list. Fields: id, product (sku, name), assigned_robot (robot_id or null), status, created_at, updated_at, completed_at.
+
+POST /api/v1/orders/
+Body: {product_sku: string}
+Logic:
+    Validate product exists. Return 404 if not.
+    Validate an active map exists. Return 400 if not.
+    Validate product has a ProductPosition on the active map. Return 400: "Product has no position on the active map."
+    Create the order with status='PENDING'.
+    Attempt auto-assignment (Section 4.6).
+    Call notify_order_update().
+    Response 201: Created order with assignment info.
+
+GET /api/v1/orders/{id}/
+Response 200: Order detail.
+
+POST /api/v1/orders/{id}/cancel/
+Logic (inside transaction.atomic with select_for_update on order and robot):
+    Validate order status is PENDING or IN_PROGRESS. Return 409 otherwise.
+    If IN_PROGRESS:
+        Publish cmd_auto CANCEL to the assigned robot: {order_id: order.id, action: "CANCEL"}.
+        Set robot.operational_mode='IDLE', robot.current_task=None. Save robot.
+        Call notify_robot_mode().
+        Check for PENDING orders and auto-assign to the now-IDLE robot.
+    Set order.status='CANCELLED'. Save order.
+    Call notify_order_update().
+    Response 200: Updated order.
+
+SECTION 10: MOCK ROBOT SIMULATOR
+
+File: mock_robot.py (standalone Python script, runs outside Django).
+
+10.1 Overview
+
+Simulates one robot per process instance. Run two instances for the two-robot fleet:
+python mock_robot.py --robot-id R1
+python mock_robot.py --robot-id R2
+
+10.2 Service Account Authentication
+
+The mock robot authenticates to the MQTT broker using the robot_user credentials from the .env file. No Django authentication is needed — the mock robot communicates exclusively via MQTT.
+
+10.3 MQTT Setup
+
+Connects to the MQTT broker with robot_user credentials.
+Sets LWT (Last Will and Testament): topic warehouse/robots/{id}/system_status, payload "OFFLINE", QoS 1, retained True.
+On connect: publishes "ONLINE" to system_status with QoS 1 and retained True.
+Subscribes to:
+    warehouse/robots/{id}/cmd_auto
+    warehouse/robots/{id}/cmd_manual
+    warehouse/robots/{id}/cmd_mapping
+
+10.4 Robot State Machine
+
+Internal states (not Django's operational_mode — these are the mock robot's own states):
+
+IDLE: Doing nothing. Publishing pose at 5Hz (stationary). Waiting for commands.
+NAVIGATING: Following waypoints from cmd_auto NAVIGATE. Publishing pose at 5Hz (moving). On reaching final waypoint, publishes mission_status "COMPLETED" and transitions to IDLE. If path is blocked (simulated: random 5% failure chance), publishes "FAILED" and transitions to IDLE.
+MANUAL: Processing cmd_manual inputs. Publishing pose at 5Hz. Watchdog: if no cmd_manual received for 500ms, set velocity to zero (stop moving) but remain in MANUAL state. Django handles the 60-second auto-release.
+MAPPING_MANUAL: Scanning while processing cmd_manual inputs. Same as MANUAL but also publishes map_preview at ~1Hz. Generates progressive map preview images (expanding circle of revealed area around robot position from a pre-loaded reference map image).
+MAPPING_AUTO: Scanning autonomously. Robot moves in a predefined exploration pattern (e.g., lawn-mower or spiral). Publishes pose at 5Hz and map_preview at ~1Hz.
+
+Transitions:
+IDLE + cmd_auto NAVIGATE -> NAVIGATING
+IDLE + cmd_manual (any key) -> MANUAL
+NAVIGATING + cmd_auto CANCEL -> IDLE (halt immediately)
+NAVIGATING + cmd_auto NAVIGATE -> NAVIGATING (restart with new waypoints)
+NAVIGATING + mission complete -> IDLE (publish COMPLETED)
+NAVIGATING + mission fail -> IDLE (publish FAILED)
+MANUAL + cmd_auto NAVIGATE -> NAVIGATING (Django sent click-to-navigate)
+MANUAL + cmd_manual watchdog timeout (500ms) -> velocity zero, remain MANUAL
+Any + cmd_mapping START_MANUAL -> MAPPING_MANUAL
+Any + cmd_mapping START_AUTO -> MAPPING_AUTO
+MAPPING_MANUAL or MAPPING_AUTO + cmd_mapping STOP_AND_SAVE -> finalize map, publish map_complete, transition to IDLE
+MAPPING_MANUAL or MAPPING_AUTO + cmd_mapping CANCEL -> discard map data, transition to IDLE
+MAPPING_MANUAL + cmd_manual -> process movement (same as MANUAL)
+MAPPING_AUTO + cmd_manual -> ignore (robot is exploring autonomously)
+
+10.5 Simulated Physics
+
+Simple 2D kinematics (no physics engine needed):
+Linear velocity: 0.5 m/s (fixed, when moving forward/backward).
+Angular velocity: 0.5 rad/s (fixed, when rotating).
+Position update: Every 200ms (matching 5Hz pose rate).
+    x += linear_vel * cos(yaw) * dt
+    y += linear_vel * sin(yaw) * dt
+    yaw += angular_vel * dt
+
+No collision detection with walls (keep it simple — the robot can drive through walls in the simulation). Document this as a known limitation.
+
+10.6 Simulated Navigation
+
+When NAVIGATING:
+For each waypoint in sequence:
+    Calculate angle to waypoint: atan2(wy - y, wx - x).
+    Rotate to face waypoint (simulate turning at angular velocity).
+    Drive forward until within 0.2m of waypoint (simulate linear movement).
+    Move to next waypoint.
+After final waypoint: publish mission_status "COMPLETED".
+Simulated failure: 5% random chance per navigation mission to publish "FAILED" instead.
+
+10.7 Simulated Mapping
+
+On START_MANUAL or START_AUTO:
+Load a reference map image from a local file (e.g., reference_map.png provided in the repo).
+Begin publishing map_preview at ~1Hz.
+Preview generation: start with an all-gray (unknown, value 128) image the same size as the reference. Progressively reveal pixels within a growing radius around the robot's current position by copying from the reference map. This simulates SLAM building the map over time.
+
+On STOP_AND_SAVE:
+Publish map_complete with the fully revealed map image (or current progress), encoded as base64 PNG, along with metadata (resolution, origin, dimensions). Use fixed values: resolution=0.05, origin_x=0.0, origin_y=0.0, width/height calculated from image dimensions * resolution.
+
+On CANCEL:
+Discard the in-progress map. Stop publishing previews.
+
+10.8 Pose Publishing
+
+Publish to warehouse/robots/{id}/pose every 200ms (5Hz):
+{"x": float, "y": float, "yaw": float}
+QoS 0, not retained.
+Publish in all states (IDLE, NAVIGATING, MANUAL, MAPPING).
+
+10.9 Error Simulation
+
+The mock robot can simulate an ERROR state for testing:
+Command-line flag: --simulate-error-after N (after N seconds, publish system_status "ERROR", then after 10 more seconds, publish "ONLINE" to self-recover).
+This allows testing the ERROR status flow without manual intervention.
+
+SECTION 11: ENVIRONMENT AND DEPLOYMENT
+
+11.1 Docker Compose
+
+Provide a docker-compose.yml for infrastructure services only (Django, React, and mock robots run natively for easier development/debugging):
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: warehouse_db
+      POSTGRES_USER: warehouse_user
+      POSTGRES_PASSWORD: warehouse_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
+  mosquitto_data:
+  mosquitto_log:
+
+11.2 Environment Variables (.env file)
+
+Backend (.env in Django project root):
+SECRET_KEY=your-django-secret-key
+DEBUG=True
+ALLOWED_HOSTS=localhost,127.0.0.1
+
+DB_NAME=warehouse_db
+DB_USER=warehouse_user
+DB_PASSWORD=warehouse_pass
+DB_HOST=localhost
+DB_PORT=5432
+
+MQTT_BROKER_HOST=localhost
+MQTT_BROKER_PORT=1883
+MQTT_USERNAME=django_user
+MQTT_PASSWORD=django_password
+
+REDIS_HOST=localhost
+REDIS_PORT=6379
+
+Frontend (.env in React project root):
+REACT_APP_API_URL=http://localhost:8000
+
+No MQTT variables in the frontend. All real-time communication uses the WebSocket connection to Django.
+
+11.3 Seed Data Management Command
+
+python manage.py seed_demo_data
+
+Creates:
+Admin user: username=admin, password=admin123.
+Two robots: R1 ("Warehouse Bot Alpha") and R2 ("Warehouse Bot Beta"), both with system_status='OFFLINE', operational_mode='IDLE'.
+Sample products: 5-10 products with various SKUs and names.
+No maps (maps come from scanning).
+No product positions (positions are assigned after maps are created).
+No orders (created manually via the UI).
+
+Mosquitto credentials (created separately via mosquitto_passwd tool):
+django_user / django_password
+robot_user / robot_password
+
+Provide setup instructions in the README for creating the Mosquitto password file and ACL file.
+
+11.4 Running the Full Stack
+
+Terminal 1: docker-compose up (PostgreSQL, Mosquitto, Redis)
+Terminal 2: python manage.py migrate && python manage.py seed_demo_data && daphne -b 0.0.0.0 -p 8000 warehouse_project.asgi:application (Django ASGI server)
+Terminal 3: python manage.py run_mqtt_listener (MQTT Listener)
+Terminal 4: cd frontend && npm start (React dev server on port 3000)
+Terminal 5: python mock_robot.py --robot-id R1 (Mock robot 1)
+Terminal 6: python mock_robot.py --robot-id R2 (Mock robot 2)
+
+SECTION 12: LOGGING
+
+Use Python's built-in logging module throughout the backend.
+
+Configure in settings.py LOGGING dict:
+Console handler for development.
+Log level INFO for application code, WARNING for third-party libraries.
+
+Log the following events at INFO level:
+Robot auto-created (new robot_id seen).
+Robot status change (ONLINE/OFFLINE/ERROR).
+Robot mode change (with previous and new mode).
+Manual control taken/released/auto-released (with username and robot_id).
+Order created, assigned, completed, failed, cancelled (with order ID and robot_id).
+Map scan started, saved, cancelled (with robot_id and map name).
+Active map changed (with old and new map names, cancelled order count).
+MQTT connected/disconnected/reconnected.
+WebSocket client connected/disconnected (with username).
+
+Log at WARNING level:
+Duplicate mission_status received (idempotency check).
+QUEUED_OFFLINE order reassignment triggered.
+Manual control timeout triggered.
+Last-seen offline detection triggered.
+
+Log at ERROR level:
+MQTT publish failures.
+Database errors.
+Unexpected exceptions (with traceback).
+
+SECTION 13: KNOWN LIMITATIONS
+
+Document these in the README:
+
+1. Token Authentication: DRF Token auth does not expire. For production, use JWT with refresh tokens or session-based auth with expiry. Acceptable for the graduation project.
+2. Mock SLAM: The mock robot's mapping simulation reveals a pre-loaded reference image progressively. It does not perform actual SLAM computation. Real deployment would use ROS 2's slam_toolbox or cartographer.
+3. No Collision Detection: The mock robot can drive through walls. Real robots have LIDAR-based obstacle avoidance.
+4. No Multi-Warehouse: The system assumes a single warehouse. Multi-warehouse support would require tenant isolation.
+5. Browser Close During Mapping: If a user closes their browser during an active scan without saving or cancelling, the robot remains in MAPPING mode indefinitely. Recovery requires another user session to cancel the scan via the API, or manual database intervention. The 60-second auto-release timeout does NOT apply to MAPPING mode by design.
+6. Single Active Map: Only one map can be active at a time. All robots operate on the same map. There is no per-robot map assignment.
+7. WebSocket Broadcast: All connected clients receive all messages. With many users, this would need per-user filtering or topic-based subscriptions. Acceptable for a small number of users.
+8. No HTTPS/WSS: Development uses HTTP and WS. Production would require TLS termination via a reverse proxy (nginx).
+
+SECTION 14: DELIVERABLES — FILE STRUCTURE
+
+Backend (Django):
+warehouse_project/
+    settings.py (PostgreSQL, Channels, Redis, CORS, DRF, logging config)
+    asgi.py (ProtocolTypeRouter with HTTP and WebSocket routing)
+    urls.py (API routes + media serving)
+api/
+    models.py (Robot, Product, ProductPosition, Order, WarehouseMap)
+    serializers.py (DRF serializers for all models)
+    views.py (DRF ViewSets and custom actions)
+    urls.py (router registration)
+    routing.py (WebSocket URL patterns)
+    consumers.py (DashboardConsumer)
+    middleware.py (WebSocket token auth middleware)
+    pagination.py (custom PageNumberPagination subclass)
+    admin.py (register all models)
+    management/
+        commands/
+            run_mqtt_listener.py
+            seed_demo_data.py
+    utils/
+        mqtt_publisher.py (thread-safe singleton MQTT client)
+        ws_notify.py (Channels layer notification helpers)
+
+Frontend (React):
+src/
+    api.js (axios instance with auth interceptor)
+    App.jsx (context providers, routing)
+    contexts/
+        ThemeContext.jsx
+        WebSocketContext.jsx
+        RobotContext.jsx
+    components/
+        Navbar.jsx
+        Sidebar.jsx
+        ProtectedRoute.jsx
+        MapCanvas.jsx (reusable canvas with interpolation, click handling, markers)
+    pages/
+        Login.jsx
+        Dashboard.jsx
+        LiveMap.jsx (Live View + Map Management tabs)
+        ManualControl.jsx (WASD + click-to-navigate + MapCanvas)
+        Inventory.jsx (Products + ProductPositions)
+        Orders.jsx
+
+Infrastructure:
+docker-compose.yml
+mosquitto/
+    config/
+        mosquitto.conf
+        acl (ACL file)
+        passwd (generated via mosquitto_passwd)
+mock_robot.py
+reference_map.png (sample map image for mock robot scanning simulation)
+.env.example
+README.md
