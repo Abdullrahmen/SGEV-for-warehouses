@@ -1,0 +1,171 @@
+<?xml version="1.0"?>
+<robot name="simple_4wd">
+  <!--
+    Convention (matches your sketch):
+      X = forward (robot's long axis / direction of travel)
+      Y = right
+      Z = up
+
+    Lidar sits at the +X (front) end of the body.
+    laser_joint rpy="0 0 -1.5708" rotates the laser frame so that:
+      - laser X  → robot -Y  (left  = 90°)
+      - laser Y  → robot +X  (front = forward)
+    BUT the physical 0° ray must point right (+Y in robot frame).
+
+    ROS LaserScan convention: angle_min is the FIRST ray, swept CCW.
+    To make 0° = right (+Y robot) with a 360° scan:
+      angle_min  = -π   (start at left/back, i.e. −180°)
+      angle_max  =  π   (end a full revolution later)
+      The laser link is rotated −90° (rpy 0 0 −π/2) so its +X
+      aligns with robot +Y (right), making the 0° ray point right.
+
+    Wheel layout:
+      front-left  (FL): +X, −Y   (forward-left  in X-forward convention)
+      front-right (FR): +X, +Y
+      rear-left   (RL): −X, −Y
+      rear-right  (RR): −X, +Y
+
+    Body: 0.60 m long (X) × 0.43 m wide (Y) × 0.16 m tall (Z)
+  -->
+
+  <!-- ======== BASE ======== -->
+  <link name="base_footprint"/>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 0.065" rpy="0 0 0"/>
+  </joint>
+
+  <link name="base_link">
+    <visual>
+      <!-- 0.60 along X (forward), 0.43 along Y (right) -->
+      <geometry><box size="0.60 0.43 0.16"/></geometry>
+      <material name="gray"><color rgba="0.7 0.7 0.7 1"/></material>
+      <origin xyz="0 0 0"/>
+    </visual>
+    <collision>
+      <geometry><box size="0.60 0.43 0.16"/></geometry>
+      <origin xyz="0 0 0"/>
+    </collision>
+    <inertial>
+      <mass value="5.0"/>
+      <origin xyz="0 0 0"/>
+      <inertia ixx="0.05" ixy="0" ixz="0"
+               iyy="0.05" iyz="0" izz="0.05"/>
+    </inertial>
+  </link>
+
+  <!-- ======== WHEELS ======== -->
+  <!-- Wheels spin around Y axis → cylinder axis along Y → rpy="1.5708 0 0" -->
+  <!-- X offset ±0.22 (half of 0.60 body - small margin)                    -->
+  <!-- Y offset ±0.245 (half of 0.43 body + half wheel width ~0.03)         -->
+
+  <link name="front_left_wheel">
+    <visual>
+      <geometry><cylinder radius="0.065" length="0.06"/></geometry>
+      <origin rpy="1.5708 0 0"/>
+      <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
+    </visual>
+    <collision>
+      <geometry><cylinder radius="0.065" length="0.06"/></geometry>
+      <origin rpy="1.5708 0 0"/>
+    </collision>
+  </link>
+  <joint name="front_left_wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="front_left_wheel"/>
+    <origin xyz="0.22 -0.245 -0.08"/>
+  </joint>
+
+  <link name="front_right_wheel">
+    <visual>
+      <geometry><cylinder radius="0.065" length="0.06"/></geometry>
+      <origin rpy="1.5708 0 0"/>
+      <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
+    </visual>
+    <collision>
+      <geometry><cylinder radius="0.065" length="0.06"/></geometry>
+      <origin rpy="1.5708 0 0"/>
+    </collision>
+  </link>
+  <joint name="front_right_wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="front_right_wheel"/>
+    <origin xyz="0.22 0.245 -0.08"/>
+  </joint>
+
+  <link name="rear_left_wheel">
+    <visual>
+      <geometry><cylinder radius="0.065" length="0.06"/></geometry>
+      <origin rpy="1.5708 0 0"/>
+      <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
+    </visual>
+    <collision>
+      <geometry><cylinder radius="0.065" length="0.06"/></geometry>
+      <origin rpy="1.5708 0 0"/>
+    </collision>
+  </link>
+  <joint name="rear_left_wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="rear_left_wheel"/>
+    <origin xyz="-0.22 -0.245 -0.08"/>
+  </joint>
+
+  <link name="rear_right_wheel">
+    <visual>
+      <geometry><cylinder radius="0.065" length="0.06"/></geometry>
+      <origin rpy="1.5708 0 0"/>
+      <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
+    </visual>
+    <collision>
+      <geometry><cylinder radius="0.065" length="0.06"/></geometry>
+      <origin rpy="1.5708 0 0"/>
+    </collision>
+  </link>
+  <joint name="rear_right_wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="rear_right_wheel"/>
+    <origin xyz="-0.22 0.245 -0.08"/>
+  </joint>
+
+  <!-- ======== LIDAR ======== -->
+  <link name="laser">
+    <visual>
+      <geometry><cylinder radius="0.04" length="0.05"/></geometry>
+      <material name="blue"><color rgba="0.0 0.0 0.8 1"/></material>
+    </visual>
+    <collision>
+      <geometry><cylinder radius="0.04" length="0.05"/></geometry>
+    </collision>
+  </link>
+
+  <!--
+    Placed at +X (front) of body, on top.
+    rpy="0 0 -1.5708":  rotates laser frame so laser +X → robot +Y (right).
+    This makes the laser's 0° ray point RIGHT, matching your sketch (0° = right).
+
+    In your laser driver / sensor plugin set:
+      angle_min  = -3.14159   (-180°, pointing LEFT  of robot)
+      angle_max  =  3.14159   (+180°, full 360° scan)
+      angle_increment = (2π / number_of_rays)
+    Rays sweep CCW in the laser frame, so:
+      -180° → left  (+Y robot? No — see below)
+
+    With the -90° yaw on laser_joint:
+      laser frame +X = robot +Y  (right)   → 0°   ray = right  ✓
+      laser frame +Y = robot -X  (back)    → 90°  ray = back
+      laser frame -X = robot -Y  (left)    → 180° ray = left
+      laser frame -Y = robot +X  (forward) → 270° ray = forward (or -90°)
+
+    So forward is at -90° (270°), right is 0°, back is ±180°, left is 90°.
+    This is the standard arrangement when 0° is defined as right and
+    positive angles sweep CCW (toward the back/left).
+  -->
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="laser"/>
+    <origin xyz="0.25 0.0 0.105" rpy="0 0 -1.5708"/>
+  </joint>
+
+</robot>

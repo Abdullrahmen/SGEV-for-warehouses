@@ -23,7 +23,7 @@ class scan_remap(Node):
         # List of blocked angle ranges as a flat list of pairs:
         #   [min1, max1, min2, max2, ...]  — all values in DEGREES
         # Default: block 150°–210° (rear chassis, centered on 180°)
-        self.declare_parameter('blocked_angles_deg', [180.0, 270.0])
+        self.declare_parameter('blocked_angles_deg', [0,10,158,232,245,256,285,292,308,322,350,360])
 
         # Value to replace blocked ranges with:
         #   float('inf')  — range is "too far" (safe for Nav2 / costmaps)
