@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Environment
+.env
+.env.example
+
+# Django
+staticfiles/
+media/
+*.db
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+
+# ROS 2 build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent / AI tooling
+.agents/
+.opencode/
+AGENTS.md
+opencode.json
+skills-lock.json
+
+# Process IDs
+.pids/
+
+# Playwright / browser testing
+.playwright-mcp/
+
+# Logs
+logs/
+*.log
+
+# Screenshots / snapshots
+*.png
+frontend-snapshot.yaml
+admin-login-snapshot.md
+
+# Root-level Playwright / test YAML files (NOT subdirectory configs)
+/admin-error.yml
+/after-login.yml
+/dashboard-new.yml
+/dashboard.yml
+/login-page.yml
+/dashboard-new.yml
+
+# Presentations (generated)
+/presentation.html
+/presentation.pptx
+/architecture.html
+
+# ROS 2 misc
+AMENT_IGNORE
+CMakeFiles/
+
+# Temporary
+tmp/
+

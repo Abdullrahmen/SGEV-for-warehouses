@@ -1,0 +1,15 @@
+user django_user
+topic write warehouse/robots/+/cmd_auto
+topic write warehouse/robots/+/cmd_manual
+topic write warehouse/robots/+/cmd_mapping
+topic read warehouse/#
+
+user robot_user
+topic write warehouse/robots/+/system_status
+topic write warehouse/robots/+/pose
+topic write warehouse/robots/+/mission_status
+topic write warehouse/robots/+/map_preview
+topic write warehouse/robots/+/map_complete
+topic read warehouse/robots/+/cmd_auto
+topic read warehouse/robots/+/cmd_manual
+topic read warehouse/robots/+/cmd_mapping

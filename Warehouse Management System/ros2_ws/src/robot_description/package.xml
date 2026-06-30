@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>robot_description</name>
+  <version>0.1.0</version>
+  <description>URDF description of the warehouse robot</description>
+  <maintainer email="user@example.com">user</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>urdf</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
