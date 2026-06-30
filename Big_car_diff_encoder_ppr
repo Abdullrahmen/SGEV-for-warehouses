@@ -31,13 +31,13 @@ float speed_filt[4] = {0};
 float speed_prev[4] = {0};
 // FR, BR, FL, BL --> Front Right, Back Right, Front Left, Back Left
 /* Encoder pins */
-const int ENC_A[NUM_MOTORS] = {34, 35, 18, 33};
-const int ENC_B[NUM_MOTORS] = {39, 36, 21, 19};
+const int ENC_A[NUM_MOTORS] = {35, 36, 0, 21};
+const int ENC_B[NUM_MOTORS] = {34, 39, 4, 22};
 
 /* Motor driver pins */
-const int DIR[NUM_MOTORS] = {13, 15, 16, 17};
+const int DIR[NUM_MOTORS] = {27, 25, 16, 18};
 
-const int PWM_PINS[NUM_MOTORS] = {25, 26, 27, 14};
+const int PWM_PINS[NUM_MOTORS] = {26, 33, 17, 19};
 const int PWM_CHANNELS[NUM_MOTORS] = {0, 1, 2, 3};
 const int PWM_FREQ = 15000;
 const int PWM_RES = 8;
@@ -293,5 +293,4 @@ void loop() {
     
   }
 }
-
 
