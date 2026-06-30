@@ -204,26 +204,26 @@ and WebSocket calls to Django automatically — single port for everything.
 ## Project structure
 
 ```
-SGEV/
-├── api/                  # Django app (models, views, consumers, utils)
-├── warehouse_project/    # Django project configuration (settings, URLs, ASGI)
-├── frontend/             # React + Vite frontend
-│   └── src/
-│       ├── components/   # Reusable UI components (MapCanvas, robot cards, etc.)
-│       ├── contexts/     # React contexts (WebSocket, theme, robot state)
-│       └── pages/        # Page components (Dashboard, LiveMap, Orders, etc.)
-├── ros2_ws/              # ROS 2 workspace
-│   ├── Dockerfile        # Ubuntu 24.04 + ROS 2 Jazzy + Gazebo
-│   └── src/
-│       ├── mqtt_bridge/           # ROS 2 ↔ MQTT translation node
-│       ├── robot_simulation/      # Gazebo simulation launch + Nav2 / SLAM config
-│       └── robot_description/     # TurtleBot4 + custom warehouse robot URDFs
-├── mosquitto/config/     # Mosquitto config + ACL
-├── docker-compose.yml    # PostgreSQL, Mosquitto, Redis, ROS 2 containers
-├── requirements.txt      # Python dependencies
-├── Makefile              # Dev commands (make logs, make migrate, etc.)
-├── start.sh              # One-command startup with flags
-└── stop.sh               # Stop all background processes
+Warehouse Management System/
+                          ├── api/                  # Django app (models, views, consumers, utils)
+                          ├── warehouse_project/    # Django project configuration (settings, URLs, ASGI)
+                          ├── frontend/             # React + Vite frontend
+                          │   └── src/
+                          │       ├── components/   # Reusable UI components (MapCanvas, robot cards, etc.)
+                          │       ├── contexts/     # React contexts (WebSocket, theme, robot state)
+                          │       └── pages/        # Page components (Dashboard, LiveMap, Orders, etc.)
+                          ├── ros2_ws/              # ROS 2 workspace
+                          │   ├── Dockerfile        # Ubuntu 24.04 + ROS 2 Jazzy + Gazebo
+                          │   └── src/
+                          │       ├── mqtt_bridge/           # ROS 2 ↔ MQTT translation node
+                          │       ├── robot_simulation/      # Gazebo simulation launch + Nav2 / SLAM config
+                          │       └── robot_description/     # TurtleBot4 + custom warehouse robot URDFs
+                          ├── mosquitto/config/     # Mosquitto config + ACL
+                          ├── docker-compose.yml    # PostgreSQL, Mosquitto, Redis, ROS 2 containers
+                          ├── requirements.txt      # Python dependencies
+                          ├── Makefile              # Dev commands (make logs, make migrate, etc.)
+                          ├── start.sh              # One-command startup with flags
+                          └── stop.sh               # Stop all background processes
 ```
 
 ## Default credentials
